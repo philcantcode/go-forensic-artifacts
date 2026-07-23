@@ -15,15 +15,58 @@ vertical slice:
 - repository and case create, discover, reopen, and concurrent access;
 - staged, atomic file and source-tree imports with distinct evidence/object
   occurrence IDs and inert symlink metadata;
-- agents, sessions, immutable activities, sealed inputs, outputs, and audit chain;
-- typed artifacts, source locators, assertions, and versioned findings;
-- typed structured queries, exact frozen selections, and provenance tracing;
-- deterministic copy-only directory projections with safe paths and manifests;
-- FTS5 metadata search and bounded streaming literal/regular-expression byte search;
-- deterministic Markdown and JSONL exports plus verified BagIt deliverables; and
-- quick, original, full, and projection integrity verification;
+- agents, sessions, immutable attributed activities, external-execution
+  metadata, custody transfers, sealed inputs, outputs, and audit chain;
+- typed artifacts, rich source locators, uncertainty-aware temporal values,
+  assertions, and versioned vulnerability findings with identifiers,
+  references, affected targets, confidence, and analyst attribution;
+- probed single-object and bounded-concurrency parser orchestration with
+  per-input isolation, durable partial results, and explicit deterministic
+  parser-output reuse;
+- wrapped external experiments with protected projection inputs, allowlisted
+  environments, bounded logs, declared outputs, and captured exit status;
+- typed structured queries across schema, media, size, provenance, evidence,
+  findings, assertions, revisions, and descendants; exact frozen selections;
+  and provenance tracing;
+- deterministic copy-only directory projections with safe paths, explicit
+  policy exclusions, typed metadata, provenance/finding sidecars, and
+  manifests;
+- FTS5 and bounded metadata search, streaming literal/regular-expression byte
+  search, and traceable saved-search artifacts;
+- deterministic Markdown and JSONL exports plus versioned, policy-auditable
+  BagIt deliverables with membership and exclusion lineage; and
+- quick, original, full, and projection integrity verification, including
+  semantic catalog and source-tree invariants;
 - signed external checkpoints; and
 - live SQLite snapshots that can be verified and restored with stable IDs.
+
+## What a source folder becomes
+
+`ImportSourceTree` treats a source-code folder as one logical accession, not as
+one indivisible parsed artifact. It creates one `Evidence` record and one
+`SourceTree` aggregate. The aggregate has a canonical manifest, while every
+regular file is a separate immutable `Object` occurrence with its own hash and
+path locator. Directories and symlinks are inert manifest entries; symlinks are
+never followed. This gives an agent one stable handle for “the repository” and
+addressable member objects for parsing, searching, tracing, and projecting.
+
+```go
+tree, err := c.ImportSourceTree(ctx, "./source", forensic.SourceTreeSpec{
+    Label: "service source at reviewed commit",
+    Acquisition: forensic.AcquisitionSpec{Method: "working-tree copy"},
+    IdempotencyKey: "service-source-v1",
+})
+
+files, err := c.Query(ctx, forensic.And(
+    forensic.InTree(tree.ID),
+    forensic.ExtensionIs(".go"),
+))
+```
+
+The default import excludes `.git`; set `IncludeGitDir` when repository history
+itself is evidence. Configurable entry, file, and byte limits bound agent-driven
+imports. Raw filesystem path bytes, display paths, file modes, hashes, and
+symlink targets are retained in the tree manifest.
 
 ## Quick start
 
@@ -75,10 +118,15 @@ selection, err := session.Freeze(ctx, forensic.FreezeSpec{
 })
 ```
 
-Every selected artifact can be followed through its generating activity and
+Every selected entity can be followed through its generating activity and
 named inputs back to original managed bytes with `Case.Trace`. `Case.Verify`
 checks the catalog, foreign keys, audit chain, blob references, digests, or a
 materialized projection without modifying the case.
+
+Large result sets can use `Case.QueryPage`. Reuse the returned `Revision` and
+`Next` cursor so traversal remains stable while other agents add data. A
+deterministic parser can opt into `ParseOptions.UseCache`; a hit creates a
+separate reuse activity and returns the original immutable output IDs.
 
 ## Storage and safety
 
@@ -92,6 +140,23 @@ Concurrency is supported across goroutines and cooperating processes on one
 host. Opening a case over NFS/SMB, distributed writes, live acquisition,
 physically deleting committed evidence, and sandboxing hostile parsers are
 outside the core library's scope.
+
+Recovery inspection reports abandoned staging files, orphaned blobs, running
+activities, and unregistered self-describing cases without silently mutating
+evidence. Explicit APIs complete safe case registration and mark interrupted
+activities when an operator decides recovery is appropriate.
+
+Schema upgrades are explicit maintenance operations. They acquire a repository
+lease, make and verify an online SQLite backup, apply versioned migrations in a
+transaction, and preserve the backup for rollback and audit.
+Portable old-schema cases require `RestoreSpec{Migrate: true}`; restore performs
+all compatibility checks before publishing anything into the repository.
+
+`Session.RunExperiment` is the optional wrapped-process boundary. It invokes a
+program directly without a shell, protects projected inputs, exposes a writable
+`output/`, captures bounded logs and only caller-declared outputs, and records
+the exit outcome. It deliberately does not claim to sandbox hostile code; use
+an OS or container sandbox where that trust boundary is required.
 
 ## Architecture decisions
 

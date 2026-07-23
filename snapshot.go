@@ -63,7 +63,7 @@ func (c *Case) Snapshot(ctx context.Context, spec SnapshotSpec) (Deliverable, er
 	}
 	var manifest PortableCaseManifest
 	manifest.Format = portableCaseFormat
-	if err = snapshotDB.QueryRowContext(ctx, "SELECT id,name,description,revision,audit_head FROM case_info WHERE singleton=1").Scan(&manifest.Case, &manifest.Name, &manifest.Description, &manifest.Revision, &manifest.AuditHead); err != nil {
+	if err = snapshotDB.QueryRowContext(ctx, "SELECT id,name,description,schema_version,revision,audit_head FROM case_info WHERE singleton=1").Scan(&manifest.Case, &manifest.Name, &manifest.Description, &manifest.SchemaVersion, &manifest.Revision, &manifest.AuditHead); err != nil {
 		snapshotDB.Close()
 		return Deliverable{}, err
 	}
@@ -165,7 +165,7 @@ func (c *Case) Snapshot(ctx context.Context, spec SnapshotSpec) (Deliverable, er
 	if err != nil {
 		return Deliverable{}, err
 	}
-	result := Deliverable{ID: did, Path: dest, SHA256: packageDigest}
+	result := Deliverable{ID: did, Path: dest, SHA256: packageDigest, Format: "forensic-portable-case-v1", Manifest: ObjectRef{ID: oid, Blob: staged.ref, Size: staged.size, DisplayName: "portable-case.json", MediaType: "application/json", Path: "portable-case.json", GeneratingActivity: aid}, Version: "1"}
 	_, err = c.mutate(ctx, c.defaultAgent.ID, "", "case.snapshot", fp, []string{string(did), string(oid)}, func(tx *sql.Tx, rev int64) error {
 		now := time.Now().UTC().Format(time.RFC3339Nano)
 		out, _ := canonicalJSON(OutcomeSucceeded())
@@ -202,13 +202,38 @@ func (c *Case) Snapshot(ctx context.Context, spec SnapshotSpec) (Deliverable, er
 		if e = inputRows.Close(); e != nil {
 			return e
 		}
-		if _, e := tx.ExecContext(ctx, "INSERT INTO deliverables(id,selection_id,path_hint,package_sha256) VALUES(?,NULL,?,?)", did, dest, packageDigest); e != nil {
+		verificationJSON := `{"ok":true,"method":"catalog-backup-and-blob-rehash"}`
+		if _, e := tx.ExecContext(ctx, "INSERT INTO deliverables(id,selection_id,path_hint,package_sha256,format,manifest_object_id,spec_json,version,verification_json) VALUES(?,NULL,?,?,?,?,?,?,?)", did, dest, packageDigest, result.Format, oid, string(cfg), result.Version, verificationJSON); e != nil {
+			return e
+		}
+		memberRows, e := tx.QueryContext(ctx, `SELECT e.id,e.kind,COALESCE(o.blob_digest,'') FROM entities e LEFT JOIN objects o ON o.id=e.id WHERE e.created_revision<=? ORDER BY e.kind,e.id`, manifest.Revision)
+		if e != nil {
+			return e
+		}
+		ordinal := 0
+		for memberRows.Next() {
+			var member DeliverableMember
+			if e = memberRows.Scan(&member.Entity.ID, &member.Entity.Kind, &member.Blob); e != nil {
+				memberRows.Close()
+				return e
+			}
+			member.Disposition = "included"
+			member.Reason = "portable case snapshot"
+			if _, e = tx.ExecContext(ctx, "INSERT INTO deliverable_members(deliverable_id,ordinal,entity_id,kind,disposition,reason,emitted_path,blob_digest) VALUES(?,?,?,?,?,?,?,?)", did, ordinal, member.Entity.ID, member.Entity.Kind, member.Disposition, member.Reason, "catalog.sqlite3", nullString(string(member.Blob))); e != nil {
+				memberRows.Close()
+				return e
+			}
+			result.Members = append(result.Members, member)
+			ordinal++
+		}
+		if e = memberRows.Close(); e != nil {
 			return e
 		}
 		if _, e := tx.ExecContext(ctx, "INSERT INTO activity_outputs(activity_id,entity_id,role) VALUES(?,?,'manifest'),(?,?,'deliverable')", aid, oid, aid, did); e != nil {
 			return e
 		}
 		result.CreatedRevision = rev
+		result.Manifest.CreatedRevision = rev
 		return nil
 	})
 	return result, err
@@ -263,6 +288,35 @@ func (r *Repository) RestoreCase(ctx context.Context, spec RestoreSpec) (*Case, 
 	got, _, err := digestFile(ctx, filepath.Join(source, "catalog.sqlite3"))
 	if err != nil || got != manifest.CatalogSHA256 {
 		return nil, fmt.Errorf("%w: catalog digest mismatch", ErrIntegrity)
+	}
+	sourceCatalog, err := openSQLiteReadOnly(ctx, filepath.Join(source, "catalog.sqlite3"), r.busy)
+	if err != nil {
+		return nil, err
+	}
+	var catalogCase CaseID
+	var catalogFormat, catalogSchema int
+	var catalogRevision int64
+	var catalogHead string
+	queryErr := sourceCatalog.QueryRowContext(ctx, "SELECT id,format_version,schema_version,revision,audit_head FROM case_info WHERE singleton=1").Scan(&catalogCase, &catalogFormat, &catalogSchema, &catalogRevision, &catalogHead)
+	if queryErr != nil {
+		_ = sourceCatalog.Close()
+		return nil, mapSQLError(queryErr)
+	}
+	if catalogSchema == SchemaVersion {
+		if validateErr := validateCaseCatalog(ctx, sourceCatalog, manifest.Case); validateErr != nil {
+			_ = sourceCatalog.Close()
+			return nil, validateErr
+		}
+	}
+	_ = sourceCatalog.Close()
+	if catalogCase != manifest.Case || catalogFormat != CaseFormat || catalogRevision != manifest.Revision || catalogHead != manifest.AuditHead || (manifest.SchemaVersion != 0 && manifest.SchemaVersion != catalogSchema) {
+		return nil, fmt.Errorf("%w: portable manifest and catalog disagree", ErrIntegrity)
+	}
+	if catalogSchema > SchemaVersion || catalogSchema < 1 {
+		return nil, fmt.Errorf("%w: portable case schema version %d", ErrUnsupportedStorage, catalogSchema)
+	}
+	if catalogSchema < SchemaVersion && !spec.Migrate {
+		return nil, fmt.Errorf("%w: portable case schema version %d requires RestoreSpec.Migrate", ErrUnsupportedStorage, catalogSchema)
 	}
 	for _, blob := range manifest.Blobs {
 		expected := portableBlobPath(blob.Blob)
@@ -323,6 +377,11 @@ func (r *Repository) RestoreCase(ctx context.Context, spec RestoreSpec) (*Case, 
 	}
 	if _, err = r.db.ExecContext(ctx, "UPDATE cases SET state='active' WHERE id=?", manifest.Case); err != nil {
 		return nil, mapSQLError(err)
+	}
+	if catalogSchema < SchemaVersion {
+		if _, err = r.MigrateCase(ctx, ByID(manifest.Case), MigrationSpec{}); err != nil {
+			return nil, err
+		}
 	}
 	return r.OpenCase(ctx, ByID(manifest.Case))
 }

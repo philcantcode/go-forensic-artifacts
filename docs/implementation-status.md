@@ -17,9 +17,18 @@ executable evidence.
 | Corruption detection | Tests inject blob, audit-chain, projection, BagIt tag, checkpoint-signature, portable-catalog, and portable-blob corruption. |
 | Traceable artifacts/deliverables | `Case.Trace` is checked from an artifact and a BagIt deliverable back to original evidence. |
 | Stable-ID portable restore | Snapshot/restore tests restore an online SQLite snapshot into a new repository and verify stable case, entity, and blob IDs. |
-| Format compatibility | Schema and format versions are independent, forward schemas fail closed, and version 1 snapshot/restore compatibility is exercised on every test run. |
+| Format compatibility | Schema and format versions are independent, forward schemas fail closed, and `TestExplicitV1ToV2Migration` plus `TestRestoreSupportedOldPortableCaseWithExplicitMigration` exercise a missing-column version-1 fixture, verified backup, audited migration, preflight-safe portable restore, and stable IDs. |
 
 Additional coverage includes hostile path sanitization, regular-file and
 source-tree imports, inert symlink handling, package payloads, bounded
-cross-chunk byte search, FTS5 startup, multi-occurrence blob deduplication,
-context cancellation, and full reopen verification.
+cross-chunk byte search, traceable saved searches, typed locator round trips,
+temporal overlap queries, bounded metadata search, FTS5 startup,
+multi-agent activity attribution, custody history, revision-stable idempotent
+replays, isolated concurrent parser orchestration, durable partial parse
+results, explicit recovery inspection and completion, auditable deliverable
+membership and lineage, projection exclusions, semantic catalog verification,
+extended typed query predicates, vulnerability-finding metadata,
+leased and backed-up schema migration, multi-occurrence blob deduplication,
+revision-pinned query pagination, deterministic parser-output reuse, rich
+projection sidecars, wrapped experiment execution, context cancellation, and
+full reopen verification.

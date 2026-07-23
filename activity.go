@@ -23,7 +23,6 @@ type Activity struct {
 	session   *Session
 	caseRef   *Case
 	id        ActivityID
-	spec      ActivitySpec
 	mu        sync.Mutex
 	cond      *sync.Cond
 	finishing bool
@@ -68,7 +67,7 @@ func (c *Case) StartSession(ctx context.Context, spec SessionSpec) (*Session, er
 			}
 			if ok {
 				info = old
-				return nil
+				return errIdempotentReplay
 			}
 		}
 		_, e := tx.ExecContext(ctx, "INSERT INTO sessions(id,agent_id,label,started_at) VALUES(?,?,?,?)", id, agent.ID, spec.Label, now.Format(time.RFC3339Nano))
@@ -139,6 +138,14 @@ func (s *Session) BeginActivity(ctx context.Context, spec ActivitySpec) (*Activi
 	if spec.CaptureMode == "" {
 		spec.CaptureMode = CaptureLibrary
 	}
+	if spec.ReportedStartedAt != nil && spec.ReportedFinishedAt != nil && spec.ReportedFinishedAt.Before(*spec.ReportedStartedAt) {
+		return nil, fmt.Errorf("%w: reported activity end precedes start", ErrInvalid)
+	}
+	for _, associated := range spec.Agents {
+		if associated.Agent == "" || strings.TrimSpace(associated.Role) == "" {
+			return nil, fmt.Errorf("%w: associated activity agent and role required", ErrInvalid)
+		}
+	}
 	id, err := newActivityID()
 	if err != nil {
 		return nil, err
@@ -147,8 +154,20 @@ func (s *Session) BeginActivity(ctx context.Context, spec ActivitySpec) (*Activi
 	if err != nil {
 		return nil, err
 	}
-	fp := sha256Hex(cfg)
+	configDigest := sha256Hex(cfg)
+	fp, _, err := digestJSON(spec)
+	if err != nil {
+		return nil, err
+	}
 	tool, _ := canonicalJSON(spec.Tool)
+	execution, _ := canonicalJSON(spec.Execution)
+	var reportedStart, reportedEnd any
+	if spec.ReportedStartedAt != nil {
+		reportedStart = spec.ReportedStartedAt.UTC().Format(time.RFC3339Nano)
+	}
+	if spec.ReportedFinishedAt != nil {
+		reportedEnd = spec.ReportedFinishedAt.UTC().Format(time.RFC3339Nano)
+	}
 	now := time.Now().UTC()
 	_, err = s.caseRef.mutate(ctx, s.info.Agent.ID, s.info.ID, "activity.begin", fp, []string{string(id)}, func(tx *sql.Tx, rev int64) error {
 		if spec.IdempotencyKey != "" {
@@ -161,12 +180,28 @@ func (s *Session) BeginActivity(ctx context.Context, spec ActivitySpec) (*Activi
 			}
 			if ok {
 				id = old.ID
-				return nil
+				return errIdempotentReplay
 			}
 		}
-		_, e := tx.ExecContext(ctx, "INSERT INTO activities(id,session_id,agent_id,type,label,tool_json,config_json,config_digest,capture_mode,state,started_at,idempotency_key) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)", id, s.ID(), s.info.Agent.ID, spec.Type, spec.Label, string(tool), string(cfg), fp, spec.CaptureMode, ActivityRunning, now.Format(time.RFC3339Nano), spec.IdempotencyKey)
+		if spec.Parent != "" {
+			var parentCount int
+			if e := tx.QueryRowContext(ctx, "SELECT COUNT(*) FROM activities WHERE id=?", spec.Parent).Scan(&parentCount); e != nil {
+				return e
+			} else if parentCount != 1 {
+				return ErrNotFound
+			}
+		}
+		_, e := tx.ExecContext(ctx, "INSERT INTO activities(id,session_id,agent_id,type,label,tool_json,config_json,config_digest,capture_mode,state,parent_activity_id,execution_json,reported_started_at,reported_finished_at,time_source,started_at,idempotency_key) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)", id, s.ID(), s.info.Agent.ID, spec.Type, spec.Label, string(tool), string(cfg), configDigest, spec.CaptureMode, ActivityRunning, nullString(string(spec.Parent)), string(execution), reportedStart, reportedEnd, spec.TimeSource, now.Format(time.RFC3339Nano), spec.IdempotencyKey)
 		if e != nil {
 			return e
+		}
+		if _, e = tx.ExecContext(ctx, "INSERT INTO activity_agents(activity_id,agent_id,role) VALUES(?,?,'operator')", id, s.info.Agent.ID); e != nil {
+			return e
+		}
+		for _, associated := range spec.Agents {
+			if _, e = tx.ExecContext(ctx, "INSERT INTO activity_agents(activity_id,agent_id,role) VALUES(?,?,?)", id, associated.Agent, associated.Role); e != nil {
+				return e
+			}
 		}
 		return storeIdempotency(ctx, tx, string(s.ID()), "activity.begin", spec.IdempotencyKey, fp, struct {
 			ID ActivityID `json:"id"`
@@ -175,8 +210,13 @@ func (s *Session) BeginActivity(ctx context.Context, spec ActivitySpec) (*Activi
 	if err != nil {
 		return nil, err
 	}
-	a := &Activity{session: s, caseRef: s.caseRef, id: id, spec: spec}
+	a := &Activity{session: s, caseRef: s.caseRef, id: id}
 	a.cond = sync.NewCond(&a.mu)
+	var state ActivityState
+	if err = s.caseRef.db.QueryRowContext(ctx, "SELECT state FROM activities WHERE id=?", id).Scan(&state); err != nil {
+		return nil, mapSQLError(err)
+	}
+	a.terminal = state != ActivityRunning
 	return a, nil
 }
 
@@ -223,6 +263,17 @@ func (a *Activity) SealInputs(ctx context.Context) error {
 		return ErrClosed
 	}
 	_, err := a.caseRef.mutate(ctx, a.session.info.Agent.ID, a.session.ID(), "activity.seal-inputs", "", []string{string(a.id)}, func(tx *sql.Tx, rev int64) error {
+		var state ActivityState
+		var sealed int
+		if e := tx.QueryRowContext(ctx, "SELECT state,inputs_sealed FROM activities WHERE id=?", a.id).Scan(&state, &sealed); e != nil {
+			return e
+		}
+		if state != ActivityRunning {
+			return ErrConflict
+		}
+		if sealed != 0 {
+			return errIdempotentReplay
+		}
 		res, e := tx.ExecContext(ctx, "UPDATE activities SET inputs_sealed=1,sealed_revision=? WHERE id=? AND state=?", rev, a.id, ActivityRunning)
 		if e != nil {
 			return e
@@ -237,6 +288,9 @@ func (a *Activity) SealInputs(ctx context.Context) error {
 }
 
 func (a *Activity) startCapture() error {
+	if a == nil {
+		return ErrClosed
+	}
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	if a.finishing || a.terminal {
@@ -248,6 +302,10 @@ func (a *Activity) startCapture() error {
 func (a *Activity) endCapture() { a.mu.Lock(); a.captures--; a.cond.Broadcast(); a.mu.Unlock() }
 
 func (a *Activity) CaptureFile(ctx context.Context, path string, spec ObjectSpec) (ObjectRef, error) {
+	if err := a.startCapture(); err != nil {
+		return ObjectRef{}, err
+	}
+	defer a.endCapture()
 	st, err := os.Lstat(path)
 	if err != nil {
 		return ObjectRef{}, err
@@ -259,11 +317,29 @@ func (a *Activity) CaptureFile(ctx context.Context, path string, spec ObjectSpec
 	if err != nil {
 		return ObjectRef{}, err
 	}
-	defer f.Close()
+	opened, err := f.Stat()
+	if err != nil || !opened.Mode().IsRegular() || !os.SameFile(st, opened) {
+		_ = f.Close()
+		return ObjectRef{}, fmt.Errorf("%w: capture source changed before import", ErrConflict)
+	}
+	staged, err := a.caseRef.stageBlob(ctx, f)
+	closeErr := f.Close()
+	if err != nil {
+		return ObjectRef{}, err
+	}
+	if closeErr != nil {
+		_ = os.Remove(staged.path)
+		return ObjectRef{}, closeErr
+	}
+	post, postErr := os.Lstat(path)
+	if postErr != nil || !post.Mode().IsRegular() || !os.SameFile(st, post) || post.Size() != opened.Size() || !post.ModTime().Equal(opened.ModTime()) {
+		_ = os.Remove(staged.path)
+		return ObjectRef{}, fmt.Errorf("%w: capture source changed during import", ErrConflict)
+	}
 	if spec.DisplayName == "" {
 		spec.DisplayName = filepath.Base(path)
 	}
-	return a.Capture(ctx, spec, f)
+	return a.captureStaged(ctx, spec, staged)
 }
 
 func (a *Activity) Capture(ctx context.Context, spec ObjectSpec, r io.Reader) (ObjectRef, error) {
@@ -275,9 +351,11 @@ func (a *Activity) Capture(ctx context.Context, spec ObjectSpec, r io.Reader) (O
 	if err != nil {
 		return ObjectRef{}, err
 	}
-	if err = a.caseRef.publishBlob(ctx, staged); err != nil {
-		return ObjectRef{}, err
-	}
+	return a.captureStaged(ctx, spec, staged)
+}
+
+func (a *Activity) captureStaged(ctx context.Context, spec ObjectSpec, staged stagedBlob) (ObjectRef, error) {
+	defer func() { _ = os.Remove(staged.path) }()
 	id, err := newObjectID()
 	if err != nil {
 		return ObjectRef{}, err
@@ -294,6 +372,24 @@ func (a *Activity) Capture(ctx context.Context, spec ObjectSpec, r io.Reader) (O
 		return ObjectRef{}, err
 	}
 	ref := ObjectRef{ID: id, Blob: staged.ref, Size: staged.size, DisplayName: spec.DisplayName, MediaType: spec.MediaType, Path: pathDisplay, GeneratingActivity: a.id}
+	if spec.IdempotencyKey != "" {
+		tx, beginErr := a.caseRef.db.BeginTx(ctx, &sql.TxOptions{ReadOnly: true})
+		if beginErr != nil {
+			return ObjectRef{}, mapSQLError(beginErr)
+		}
+		var old ObjectRef
+		found, lookupErr := lookupIdempotency(ctx, tx, string(a.id), "object.capture", spec.IdempotencyKey, fp, &old)
+		_ = tx.Rollback()
+		if lookupErr != nil {
+			return ObjectRef{}, lookupErr
+		}
+		if found {
+			return old, nil
+		}
+	}
+	if err = a.caseRef.publishBlob(ctx, staged); err != nil {
+		return ObjectRef{}, err
+	}
 	_, err = a.caseRef.mutate(ctx, a.session.info.Agent.ID, a.session.ID(), "object.capture", fp, []string{string(a.id), string(id), string(staged.ref)}, func(tx *sql.Tx, rev int64) error {
 		if spec.IdempotencyKey != "" {
 			var old ObjectRef
@@ -303,7 +399,7 @@ func (a *Activity) Capture(ctx context.Context, spec ObjectSpec, r io.Reader) (O
 			}
 			if ok {
 				ref = old
-				return nil
+				return errIdempotentReplay
 			}
 		}
 		var state string
@@ -383,7 +479,7 @@ func (a *Activity) Finish(ctx context.Context, outcome Outcome) error {
 		if n == 0 {
 			var state string
 			if e = tx.QueryRowContext(ctx, "SELECT state FROM activities WHERE id=?", a.id).Scan(&state); e == nil && state == string(outcome.State) {
-				return nil
+				return errIdempotentReplay
 			}
 			return ErrConflict
 		}
@@ -411,8 +507,26 @@ func (c *Case) ImportEvidenceFile(ctx context.Context, path string, spec Evidenc
 	if err != nil {
 		return Evidence{}, err
 	}
-	defer f.Close()
-	return c.ImportEvidence(ctx, filepath.Base(path), spec, f)
+	opened, err := f.Stat()
+	if err != nil || !opened.Mode().IsRegular() || !os.SameFile(st, opened) {
+		_ = f.Close()
+		return Evidence{}, fmt.Errorf("%w: evidence source changed before import", ErrConflict)
+	}
+	staged, err := c.stageBlob(ctx, f)
+	closeErr := f.Close()
+	if err != nil {
+		return Evidence{}, err
+	}
+	if closeErr != nil {
+		_ = os.Remove(staged.path)
+		return Evidence{}, closeErr
+	}
+	post, postErr := os.Lstat(path)
+	if postErr != nil || !post.Mode().IsRegular() || !os.SameFile(st, post) || post.Size() != opened.Size() || !post.ModTime().Equal(opened.ModTime()) {
+		_ = os.Remove(staged.path)
+		return Evidence{}, fmt.Errorf("%w: evidence source changed during import", ErrConflict)
+	}
+	return c.importEvidenceStaged(ctx, filepath.Base(path), spec, staged)
 }
 
 func (c *Case) ImportEvidence(ctx context.Context, name string, spec EvidenceSpec, r io.Reader) (Evidence, error) {
@@ -423,12 +537,13 @@ func (c *Case) ImportEvidence(ctx context.Context, name string, spec EvidenceSpe
 	if err != nil {
 		return Evidence{}, err
 	}
+	return c.importEvidenceStaged(ctx, name, spec, staged)
+}
+
+func (c *Case) importEvidenceStaged(ctx context.Context, name string, spec EvidenceSpec, staged stagedBlob) (Evidence, error) {
+	defer func() { _ = os.Remove(staged.path) }()
 	if want := strings.ToLower(spec.Acquisition.SuppliedHashes["sha256"]); want != "" && want != staged.digest {
-		_ = os.Remove(staged.path)
 		return Evidence{}, fmt.Errorf("%w: supplied SHA-256 does not match managed bytes", ErrIntegrity)
-	}
-	if err = c.publishBlob(ctx, staged); err != nil {
-		return Evidence{}, err
 	}
 	eid, err := newEvidenceID()
 	if err != nil {
@@ -450,6 +565,24 @@ func (c *Case) ImportEvidence(ctx context.Context, name string, spec EvidenceSpe
 	if err != nil {
 		return Evidence{}, err
 	}
+	if spec.IdempotencyKey != "" {
+		tx, beginErr := c.db.BeginTx(ctx, &sql.TxOptions{ReadOnly: true})
+		if beginErr != nil {
+			return Evidence{}, mapSQLError(beginErr)
+		}
+		var old Evidence
+		found, lookupErr := lookupIdempotency(ctx, tx, string(c.id), "evidence.import", spec.IdempotencyKey, fp, &old)
+		_ = tx.Rollback()
+		if lookupErr != nil {
+			return Evidence{}, lookupErr
+		}
+		if found {
+			return old, nil
+		}
+	}
+	if err = c.publishBlob(ctx, staged); err != nil {
+		return Evidence{}, err
+	}
 	result := Evidence{ID: eid, Label: spec.Label, Acquisition: spec.Acquisition, RootObject: ObjectRef{ID: oid, Blob: staged.ref, Size: staged.size, DisplayName: name, GeneratingActivity: aid}}
 	_, err = c.mutate(ctx, c.defaultAgent.ID, "", "evidence.import", fp, []string{string(eid), string(oid), string(staged.ref)}, func(tx *sql.Tx, rev int64) error {
 		if spec.IdempotencyKey != "" {
@@ -460,7 +593,7 @@ func (c *Case) ImportEvidence(ctx context.Context, name string, spec EvidenceSpe
 			}
 			if ok {
 				result = old
-				return nil
+				return errIdempotentReplay
 			}
 		}
 		now := time.Now().UTC().Format(time.RFC3339Nano)

@@ -287,8 +287,21 @@ func TestAuditTamperAndProducerConflict(t *testing.T) {
 		t.Fatal(err)
 	}
 	draft := ArtifactDraft{Type: "urn:test/v1", Source: ev.RootObject.ID, Values: []ArtifactValue{{Property: "x", Type: ValueString, Raw: "one"}}}
-	if _, err = run.EmitArtifact(ctx, "stable", draft); err != nil {
+	first, err := run.EmitArtifact(ctx, "stable", draft)
+	if err != nil {
 		t.Fatal(err)
+	}
+	beforeReplay, err := c.Info(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	replayed, err := run.EmitArtifact(ctx, "stable", draft)
+	if err != nil || replayed.ID != first.ID || replayed.CreatedRevision != first.CreatedRevision {
+		t.Fatalf("producer replay mismatch: %#v %#v %v", first, replayed, err)
+	}
+	afterReplay, err := c.Info(ctx)
+	if err != nil || afterReplay.Revision != beforeReplay.Revision {
+		t.Fatalf("producer replay advanced revision: %d -> %d: %v", beforeReplay.Revision, afterReplay.Revision, err)
 	}
 	draft.Values[0].Raw = "two"
 	if _, err = run.EmitArtifact(ctx, "stable", draft); !errors.Is(err, ErrConflict) {
@@ -699,5 +712,30 @@ func TestStreamingByteSearchAcrossChunkBoundary(t *testing.T) {
 	}
 	if len(hits) != 1 || hits[0].Offset != byteSearchChunk-3 || string(hits[0].Context) != "xxxneedlexxx" {
 		t.Fatalf("boundary hits: %#v", hits)
+	}
+}
+
+func TestEvidenceIdempotencyConflictDoesNotPublishOrphanBytes(t *testing.T) {
+	ctx, _, _, c := openTestRepo(t)
+	if _, err := c.ImportEvidence(ctx, "first", EvidenceSpec{Label: "first", IdempotencyKey: "one-accession"}, strings.NewReader("first bytes")); err != nil {
+		t.Fatal(err)
+	}
+	before, err := c.Info(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err = c.ImportEvidence(ctx, "second", EvidenceSpec{Label: "second", IdempotencyKey: "one-accession"}, strings.NewReader("different bytes")); !errors.Is(err, ErrConflict) {
+		t.Fatalf("changed idempotent import = %v", err)
+	}
+	after, err := c.Info(ctx)
+	if err != nil || after.Revision != before.Revision {
+		t.Fatalf("conflict changed revision: %d -> %d: %v", before.Revision, after.Revision, err)
+	}
+	recovery, err := c.InspectRecovery(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(recovery.OrphanBlobs) != 0 || len(recovery.StagingFiles) != 0 {
+		t.Fatalf("idempotency conflict left recovery debris: %#v", recovery)
 	}
 }

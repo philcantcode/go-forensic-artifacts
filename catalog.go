@@ -29,6 +29,10 @@ CREATE TABLE IF NOT EXISTS idempotency (
   scope TEXT NOT NULL, operation TEXT NOT NULL, key TEXT NOT NULL,
   fingerprint TEXT NOT NULL, result_json TEXT NOT NULL,
   PRIMARY KEY(scope,operation,key)
+);
+CREATE TABLE IF NOT EXISTS maintenance_leases (
+  case_id TEXT PRIMARY KEY REFERENCES cases(id), holder TEXT NOT NULL,
+  acquired_at TEXT NOT NULL, expires_at TEXT NOT NULL
 );`
 
 const caseSchema = `
@@ -61,9 +65,15 @@ CREATE TABLE IF NOT EXISTS activities (
   type TEXT NOT NULL, label TEXT NOT NULL, tool_json TEXT, config_json TEXT NOT NULL,
   config_digest TEXT NOT NULL, capture_mode TEXT NOT NULL, state TEXT NOT NULL,
   inputs_sealed INTEGER NOT NULL DEFAULT 0, sealed_revision INTEGER,
+	parent_activity_id TEXT REFERENCES activities(id), execution_json TEXT,
+	reported_started_at TEXT, reported_finished_at TEXT, time_source TEXT NOT NULL DEFAULT '',
   started_at TEXT NOT NULL, finished_at TEXT, outcome_json TEXT, idempotency_key TEXT
 );
 CREATE INDEX IF NOT EXISTS activities_session ON activities(session_id);
+CREATE TABLE IF NOT EXISTS activity_agents (
+	activity_id TEXT NOT NULL REFERENCES activities(id), agent_id TEXT NOT NULL REFERENCES agents(id),
+	role TEXT NOT NULL, PRIMARY KEY(activity_id,agent_id,role)
+);
 CREATE TABLE IF NOT EXISTS entities (
   id TEXT PRIMARY KEY, kind TEXT NOT NULL, schema_uri TEXT NOT NULL DEFAULT '',
   schema_version INTEGER NOT NULL DEFAULT 1,
@@ -104,7 +114,8 @@ CREATE TABLE IF NOT EXISTS source_trees (
 );
 CREATE TABLE IF NOT EXISTS tree_entries (
   tree_id TEXT NOT NULL REFERENCES source_trees(id), ordinal INTEGER NOT NULL,
-  path TEXT NOT NULL, entry_kind TEXT NOT NULL, file_mode INTEGER NOT NULL,
+	path TEXT NOT NULL, raw_path BLOB NOT NULL DEFAULT X'', path_encoding TEXT NOT NULL DEFAULT '',
+	path_separator TEXT NOT NULL DEFAULT '', entry_kind TEXT NOT NULL, file_mode INTEGER NOT NULL,
   size INTEGER NOT NULL, blob_digest TEXT, object_id TEXT REFERENCES objects(id), link_target TEXT NOT NULL,
   PRIMARY KEY(tree_id,ordinal), UNIQUE(tree_id,path),
   FOREIGN KEY(blob_digest) REFERENCES blobs(digest)
@@ -124,12 +135,19 @@ CREATE INDEX IF NOT EXISTS artifacts_type ON artifacts(artifact_type,id);
 CREATE UNIQUE INDEX IF NOT EXISTS artifacts_producer_key ON artifacts(generating_activity_id,producer_key) WHERE producer_key<>'';
 CREATE TABLE IF NOT EXISTS artifact_values (
   artifact_id TEXT NOT NULL REFERENCES artifacts(id), ordinal INTEGER NOT NULL,
-  property TEXT NOT NULL, value_type TEXT NOT NULL, raw TEXT NOT NULL,
-  normalized_json TEXT, unit TEXT NOT NULL, language TEXT NOT NULL,
-  confidence REAL, locator_type TEXT, locator_json TEXT,
+  property TEXT NOT NULL, schema_uri TEXT NOT NULL DEFAULT '', value_type TEXT NOT NULL, raw TEXT NOT NULL,
+  normalized_json TEXT, unit TEXT NOT NULL, encoding TEXT NOT NULL DEFAULT '', language TEXT NOT NULL,
+  confidence REAL, interpretation TEXT NOT NULL DEFAULT '', locator_type TEXT, locator_json TEXT,
   PRIMARY KEY(artifact_id,ordinal)
 );
 CREATE INDEX IF NOT EXISTS artifact_values_property ON artifact_values(property,raw);
+CREATE TABLE IF NOT EXISTS temporal_values (
+  artifact_id TEXT NOT NULL REFERENCES artifacts(id), value_ordinal INTEGER NOT NULL,
+  temporal_json TEXT NOT NULL, utc_start TEXT, utc_end TEXT, semantic_role TEXT NOT NULL,
+  PRIMARY KEY(artifact_id,value_ordinal),
+  FOREIGN KEY(artifact_id,value_ordinal) REFERENCES artifact_values(artifact_id,ordinal)
+);
+CREATE INDEX IF NOT EXISTS temporal_values_range ON temporal_values(semantic_role,utc_start,utc_end,artifact_id);
 CREATE VIRTUAL TABLE IF NOT EXISTS artifact_fts USING fts5(artifact_id UNINDEXED, property UNINDEXED, text);
 CREATE TABLE IF NOT EXISTS assertions (
 	id TEXT PRIMARY KEY REFERENCES entities(id), assertion_type TEXT NOT NULL, body TEXT NOT NULL,
@@ -148,7 +166,8 @@ CREATE TABLE IF NOT EXISTS findings (
 CREATE TABLE IF NOT EXISTS finding_revisions (
   id TEXT PRIMARY KEY REFERENCES entities(id), finding_id TEXT NOT NULL REFERENCES findings(id),
   version INTEGER NOT NULL, body TEXT NOT NULL, status TEXT NOT NULL, confidence REAL,
-  severity TEXT NOT NULL, predecessor_id TEXT REFERENCES finding_revisions(id),
+	severity TEXT NOT NULL, review_state TEXT NOT NULL DEFAULT '', assignees_json TEXT NOT NULL DEFAULT '[]',
+	vulnerability_json TEXT, predecessor_id TEXT REFERENCES finding_revisions(id),
   UNIQUE(finding_id,version)
 );
 CREATE TABLE IF NOT EXISTS finding_members (
@@ -173,6 +192,11 @@ CREATE TABLE IF NOT EXISTS projection_members (
   entity_id TEXT NOT NULL REFERENCES entities(id), kind TEXT NOT NULL, reason TEXT NOT NULL,
   PRIMARY KEY(projection_id,ordinal), UNIQUE(projection_id,entity_id)
 );
+CREATE TABLE IF NOT EXISTS projection_exclusions (
+	projection_id TEXT NOT NULL REFERENCES projections(id), ordinal INTEGER NOT NULL,
+	entity_id TEXT NOT NULL REFERENCES entities(id), kind TEXT NOT NULL, reason TEXT NOT NULL,
+	PRIMARY KEY(projection_id,ordinal), UNIQUE(projection_id,entity_id)
+);
 CREATE TABLE IF NOT EXISTS materializations (
   id TEXT PRIMARY KEY, projection_id TEXT NOT NULL REFERENCES projections(id),
   destination TEXT NOT NULL, manifest_object_id TEXT NOT NULL REFERENCES objects(id),
@@ -180,12 +204,45 @@ CREATE TABLE IF NOT EXISTS materializations (
 );
 CREATE TABLE IF NOT EXISTS deliverables (
 	id TEXT PRIMARY KEY REFERENCES entities(id), selection_id TEXT REFERENCES selections(id),
-  path_hint TEXT NOT NULL, package_sha256 TEXT NOT NULL
+	path_hint TEXT NOT NULL, package_sha256 TEXT NOT NULL, format TEXT NOT NULL DEFAULT '',
+	closure TEXT NOT NULL DEFAULT '', manifest_object_id TEXT REFERENCES objects(id), spec_json TEXT NOT NULL DEFAULT '{}',
+	version TEXT NOT NULL DEFAULT '', predecessor_id TEXT REFERENCES deliverables(id), recipient TEXT NOT NULL DEFAULT '',
+	purpose TEXT NOT NULL DEFAULT '', redaction_policy TEXT NOT NULL DEFAULT '', verification_json TEXT NOT NULL DEFAULT '{}'
 );
+CREATE TABLE IF NOT EXISTS deliverable_members (
+	deliverable_id TEXT NOT NULL REFERENCES deliverables(id), ordinal INTEGER NOT NULL,
+	entity_id TEXT NOT NULL REFERENCES entities(id), kind TEXT NOT NULL, disposition TEXT NOT NULL,
+	reason TEXT NOT NULL, emitted_path TEXT NOT NULL, blob_digest TEXT,
+	PRIMARY KEY(deliverable_id,ordinal), UNIQUE(deliverable_id,entity_id),
+	FOREIGN KEY(blob_digest) REFERENCES blobs(digest)
+);
+CREATE TABLE IF NOT EXISTS custody_events (
+	activity_id TEXT PRIMARY KEY REFERENCES activities(id), item_entity_id TEXT NOT NULL REFERENCES entities(id),
+	from_agent_id TEXT REFERENCES agents(id), to_agent_id TEXT REFERENCES agents(id),
+	from_location TEXT NOT NULL, to_location TEXT NOT NULL, purpose TEXT NOT NULL,
+	reference_number TEXT NOT NULL, occurred_at TEXT NOT NULL, recorded_at TEXT NOT NULL,
+	acknowledgement_json TEXT NOT NULL, signature BLOB, created_revision INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS custody_events_item ON custody_events(item_entity_id,occurred_at,activity_id);
 CREATE TABLE IF NOT EXISTS idempotency_keys (
   scope TEXT NOT NULL, operation TEXT NOT NULL, key TEXT NOT NULL,
   fingerprint TEXT NOT NULL, result_json TEXT NOT NULL,
   PRIMARY KEY(scope,operation,key)
+);
+CREATE TABLE IF NOT EXISTS maintenance_leases (
+  name TEXT PRIMARY KEY, holder TEXT NOT NULL, acquired_at TEXT NOT NULL,
+  expires_at TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS parser_cache (
+  cache_key TEXT PRIMARY KEY, parser_id TEXT NOT NULL, parser_version TEXT NOT NULL,
+  parser_build_digest TEXT NOT NULL, config_digest TEXT NOT NULL,
+  input_object_id TEXT NOT NULL REFERENCES objects(id), source_activity_id TEXT NOT NULL REFERENCES activities(id),
+  created_revision INTEGER NOT NULL
+);
+CREATE TABLE IF NOT EXISTS parser_cache_outputs (
+  cache_key TEXT NOT NULL REFERENCES parser_cache(cache_key), ordinal INTEGER NOT NULL,
+  entity_id TEXT NOT NULL REFERENCES entities(id), PRIMARY KEY(cache_key,ordinal),
+  UNIQUE(cache_key,entity_id)
 );`
 
 func sqliteDSN(path string, busy time.Duration) (string, error) {
@@ -218,6 +275,33 @@ func openSQLite(ctx context.Context, path string, busy time.Duration) (*sql.DB, 
 	db.SetMaxOpenConns(16)
 	db.SetMaxIdleConns(4)
 	if err := db.PingContext(ctx); err != nil {
+		db.Close()
+		return nil, mapSQLError(err)
+	}
+	return db, nil
+}
+
+func openSQLiteReadOnly(ctx context.Context, path string, busy time.Duration) (*sql.DB, error) {
+	abs, err := filepath.Abs(path)
+	if err != nil {
+		return nil, err
+	}
+	if busy <= 0 {
+		busy = 5 * time.Second
+	}
+	q := url.Values{}
+	q.Set("mode", "ro")
+	q.Add("_pragma", "foreign_keys(1)")
+	q.Add("_pragma", "trusted_schema(0)")
+	q.Add("_pragma", "query_only(1)")
+	q.Add("_pragma", fmt.Sprintf("busy_timeout(%d)", busy.Milliseconds()))
+	dsn := "file:" + filepath.ToSlash(abs) + "?" + q.Encode()
+	db, err := sql.Open("sqlite", dsn)
+	if err != nil {
+		return nil, fmt.Errorf("open read-only sqlite: %w", err)
+	}
+	db.SetMaxOpenConns(4)
+	if err = db.PingContext(ctx); err != nil {
 		db.Close()
 		return nil, mapSQLError(err)
 	}
@@ -293,6 +377,77 @@ func validateCaseCatalog(ctx context.Context, db *sql.DB, want CaseID) error {
 	if version < SchemaVersion {
 		return fmt.Errorf("%w: no migration from schema version %d", ErrUnsupportedStorage, version)
 	}
+	return validateRequiredCaseSchema(ctx, db)
+}
+
+func validateRequiredCaseSchema(ctx context.Context, db *sql.DB) error {
+	required := map[string][]string{
+		"schema_migrations":     {"version", "applied_at"},
+		"case_info":             {"id", "format_version", "schema_version", "revision", "audit_head"},
+		"revisions":             {"revision"},
+		"audit_events":          {"sequence", "revision", "event_json", "event_hash"},
+		"agents":                {"id", "kind", "name"},
+		"sessions":              {"id", "agent_id"},
+		"activities":            {"id", "parent_activity_id", "execution_json", "reported_started_at", "reported_finished_at", "time_source"},
+		"activity_agents":       {"activity_id", "agent_id", "role"},
+		"entities":              {"id", "kind", "generating_activity_id", "created_revision"},
+		"activity_inputs":       {"activity_id", "entity_id", "role"},
+		"activity_outputs":      {"activity_id", "entity_id", "role"},
+		"blobs":                 {"digest", "size"},
+		"objects":               {"id", "blob_digest", "size"},
+		"evidence":              {"id", "acquisition_json"},
+		"evidence_objects":      {"evidence_id", "object_id", "role"},
+		"source_trees":          {"id", "evidence_id", "manifest_object_id", "tree_digest"},
+		"tree_entries":          {"tree_id", "path", "raw_path", "path_encoding", "path_separator", "entry_kind", "object_id"},
+		"source_locators":       {"entity_id", "locator_type", "locator_json"},
+		"artifacts":             {"id", "source_object_id", "producer_fingerprint"},
+		"artifact_values":       {"artifact_id", "schema_uri", "encoding", "interpretation", "locator_json"},
+		"temporal_values":       {"artifact_id", "value_ordinal", "temporal_json"},
+		"artifact_fts":          {"artifact_id", "property", "text"},
+		"assertions":            {"id", "assertion_type", "supersedes_id"},
+		"assertion_targets":     {"assertion_id", "target_id", "target_kind"},
+		"findings":              {"id", "current_revision_id"},
+		"finding_revisions":     {"id", "finding_id", "review_state", "assignees_json", "vulnerability_json"},
+		"finding_members":       {"revision_id", "entity_id", "role"},
+		"selections":            {"id", "observed_revision", "query_json"},
+		"selection_members":     {"selection_id", "entity_id", "kind"},
+		"projections":           {"id", "selection_id", "spec_json"},
+		"projection_members":    {"projection_id", "entity_id", "kind"},
+		"projection_exclusions": {"projection_id", "entity_id", "reason"},
+		"materializations":      {"id", "projection_id", "manifest_object_id"},
+		"deliverables":          {"id", "format", "closure", "manifest_object_id", "verification_json"},
+		"deliverable_members":   {"deliverable_id", "entity_id", "disposition"},
+		"custody_events":        {"activity_id", "item_entity_id", "occurred_at"},
+		"idempotency_keys":      {"scope", "operation", "key", "fingerprint"},
+		"maintenance_leases":    {"name", "holder", "expires_at"},
+		"parser_cache":          {"cache_key", "input_object_id", "source_activity_id"},
+		"parser_cache_outputs":  {"cache_key", "ordinal", "entity_id"},
+	}
+	for table, columns := range required {
+		rows, err := db.QueryContext(ctx, "PRAGMA table_info("+table+")")
+		if err != nil {
+			return mapSQLError(err)
+		}
+		found := map[string]bool{}
+		for rows.Next() {
+			var ordinal, notNull, primaryKey int
+			var name, columnType string
+			var defaultValue any
+			if err = rows.Scan(&ordinal, &name, &columnType, &notNull, &defaultValue, &primaryKey); err != nil {
+				rows.Close()
+				return err
+			}
+			found[name] = true
+		}
+		if err = rows.Close(); err != nil {
+			return err
+		}
+		for _, column := range columns {
+			if !found[column] {
+				return fmt.Errorf("%w: schema version %d lacks %s.%s", ErrIntegrity, SchemaVersion, table, column)
+			}
+		}
+	}
 	return nil
 }
 
@@ -326,6 +481,8 @@ type mutationEvent struct {
 	RecordedAt    string    `json:"recorded_at"`
 }
 
+var errIdempotentReplay = errors.New("forensic: internal idempotent replay")
+
 func (c *Case) mutate(ctx context.Context, actor AgentID, session SessionID, operation, requestDigest string, affected []string, apply func(*sql.Tx, int64) error) (int64, error) {
 	if err := c.checkOpen(); err != nil {
 		return 0, err
@@ -352,6 +509,9 @@ func (c *Case) mutate(ctx context.Context, actor AgentID, session SessionID, ope
 		next := rev + 1
 		if err = apply(tx, next); err != nil {
 			tx.Rollback()
+			if errors.Is(err, errIdempotentReplay) {
+				return rev, nil
+			}
 			return 0, mapSQLError(err)
 		}
 		now := time.Now().UTC().Format(time.RFC3339Nano)

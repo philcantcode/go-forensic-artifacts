@@ -50,6 +50,9 @@ func TestSourceTreeImportQueryAndVerification(t *testing.T) {
 	fileObjects := map[string]ObjectRef{}
 	for _, entry := range tree.Entries {
 		paths = append(paths, entry.Path)
+		if string(entry.RawPath) != entry.Path || entry.Encoding != "filesystem" || entry.Separator == "" {
+			t.Fatalf("source path representation was not retained: %#v", entry)
+		}
 		if entry.Path == ".git" || strings.HasPrefix(entry.Path, ".git/") {
 			t.Fatalf("excluded .git entry was imported: %q", entry.Path)
 		}
@@ -135,5 +138,29 @@ func TestSourceTreeImportQueryAndVerification(t *testing.T) {
 				t.Fatalf("symlink root = %v, want invalid", err)
 			}
 		}
+	}
+}
+
+func TestSourceTreeImportResourceLimits(t *testing.T) {
+	ctx, base, _, c := openTestRepo(t)
+	root := filepath.Join(base, "bounded-source")
+	if err := os.Mkdir(root, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(root, "one"), []byte("1234"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(root, "two"), []byte("5678"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := c.ImportSourceTree(ctx, root, SourceTreeSpec{MaxFiles: 1, MaxEntries: 10, MaxBytes: 100}); !errors.Is(err, ErrInvalid) {
+		t.Fatalf("file limit error = %v", err)
+	}
+	if _, err := c.ImportSourceTree(ctx, root, SourceTreeSpec{MaxFiles: 10, MaxEntries: 10, MaxBytes: 7}); !errors.Is(err, ErrInvalid) {
+		t.Fatalf("byte limit error = %v", err)
+	}
+	var trees int
+	if err := c.db.QueryRowContext(ctx, "SELECT count(*) FROM source_trees").Scan(&trees); err != nil || trees != 0 {
+		t.Fatalf("limited import committed a tree: %d %v", trees, err)
 	}
 }

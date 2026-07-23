@@ -10,7 +10,7 @@ import (
 const (
 	RepositoryFormat = 1
 	CaseFormat       = 1
-	SchemaVersion    = 1
+	SchemaVersion    = 2
 )
 
 type AgentKind string
@@ -51,6 +51,21 @@ type CaseInfo struct {
 	Revision    int64     `json:"revision"`
 }
 
+// MigrationSpec controls an explicit case-catalog migration. Ordinary case
+// opening never changes an on-disk schema.
+type MigrationSpec struct {
+	BackupPath    string        `json:"backup_path,omitempty"`
+	LeaseDuration time.Duration `json:"lease_duration,omitempty"`
+}
+
+type MigrationResult struct {
+	Case        CaseID `json:"case"`
+	FromVersion int    `json:"from_version"`
+	ToVersion   int    `json:"to_version"`
+	BackupPath  string `json:"backup_path,omitempty"`
+	Revision    int64  `json:"revision"`
+}
+
 type CaseSelector struct {
 	id   CaseID
 	name string
@@ -80,6 +95,7 @@ const (
 	ActivityImport                ActivityType = "object.import"
 	ActivityExtract               ActivityType = "object.extract"
 	ActivityParse                 ActivityType = "artifact.parse"
+	ActivityParserReuse           ActivityType = "artifact.parse.reuse"
 	ActivitySearch                ActivityType = "entity.search"
 	ActivityFindingAuthor         ActivityType = "finding.author"
 	ActivityFindingReview         ActivityType = "finding.review"
@@ -90,6 +106,7 @@ const (
 	ActivityAssertionRecord       ActivityType = "assertion.record"
 	ActivityDeliverablePackage    ActivityType = "deliverable.package"
 	ActivityIntegrityVerify       ActivityType = "integrity.verify"
+	ActivityCustodyTransfer       ActivityType = "custody.transfer"
 )
 
 type CaptureMode string
@@ -107,13 +124,40 @@ type ToolDescriptor struct {
 	BuildDigest string `json:"build_digest,omitempty"`
 	URI         string `json:"uri,omitempty"`
 }
+
+type ActivityAgent struct {
+	Agent AgentID `json:"agent"`
+	Role  string  `json:"role"`
+}
+
+// ExecutionDescriptor is an allowlisted account of work performed outside the
+// library. Environment should contain only values safe to retain; sensitive
+// values can instead be represented by caller-computed digests.
+type ExecutionDescriptor struct {
+	Command            string            `json:"command,omitempty"`
+	Arguments          []string          `json:"arguments,omitempty"`
+	WorkingDirectory   string            `json:"working_directory,omitempty"`
+	Environment        map[string]string `json:"environment,omitempty"`
+	EnvironmentDigests map[string]string `json:"environment_digests,omitempty"`
+	Runtime            string            `json:"runtime,omitempty"`
+	ContainerImage     string            `json:"container_image,omitempty"`
+	Sandbox            string            `json:"sandbox,omitempty"`
+	Host               string            `json:"host,omitempty"`
+}
+
 type ActivitySpec struct {
-	Type           ActivityType    `json:"type"`
-	Label          string          `json:"label"`
-	Tool           *ToolDescriptor `json:"tool,omitempty"`
-	Config         map[string]any  `json:"config,omitempty"`
-	CaptureMode    CaptureMode     `json:"capture_mode,omitempty"`
-	IdempotencyKey string          `json:"-"`
+	Type               ActivityType         `json:"type"`
+	Label              string               `json:"label"`
+	Tool               *ToolDescriptor      `json:"tool,omitempty"`
+	Config             map[string]any       `json:"config,omitempty"`
+	CaptureMode        CaptureMode          `json:"capture_mode,omitempty"`
+	Parent             ActivityID           `json:"parent,omitempty"`
+	Agents             []ActivityAgent      `json:"agents,omitempty"`
+	Execution          *ExecutionDescriptor `json:"execution,omitempty"`
+	ReportedStartedAt  *time.Time           `json:"reported_started_at,omitempty"`
+	ReportedFinishedAt *time.Time           `json:"reported_finished_at,omitempty"`
+	TimeSource         string               `json:"time_source,omitempty"`
+	IdempotencyKey     string               `json:"-"`
 }
 type ActivityState string
 
@@ -190,6 +234,9 @@ type SourceTreeSpec struct {
 	Label          string          `json:"label"`
 	Acquisition    AcquisitionSpec `json:"acquisition"`
 	IncludeGitDir  bool            `json:"include_git_dir"`
+	MaxEntries     int             `json:"max_entries,omitempty"`
+	MaxFiles       int             `json:"max_files,omitempty"`
+	MaxBytes       int64           `json:"max_bytes,omitempty"`
 	IdempotencyKey string          `json:"-"`
 }
 
@@ -203,6 +250,9 @@ const (
 
 type TreeEntry struct {
 	Path       string        `json:"path"`
+	RawPath    []byte        `json:"raw_path,omitempty"`
+	Encoding   string        `json:"encoding,omitempty"`
+	Separator  string        `json:"separator,omitempty"`
 	Kind       TreeEntryKind `json:"kind"`
 	Mode       uint32        `json:"mode"`
 	Size       int64         `json:"size,omitempty"`
@@ -230,10 +280,15 @@ func (t SourceTree) EntityRef() EntityRef {
 type LocatorType string
 
 const (
-	LocatorPath   LocatorType = "path"
-	LocatorExtent LocatorType = "extent"
-	LocatorJSON   LocatorType = "json"
-	LocatorCustom LocatorType = "custom"
+	LocatorPath     LocatorType = "path"
+	LocatorExtent   LocatorType = "extent"
+	LocatorSQLite   LocatorType = "sqlite"
+	LocatorJSON     LocatorType = "json"
+	LocatorXML      LocatorType = "xml"
+	LocatorArchive  LocatorType = "archive"
+	LocatorRegistry LocatorType = "registry"
+	LocatorAPI      LocatorType = "api"
+	LocatorCustom   LocatorType = "custom"
 )
 
 type SourceLocator interface{ LocatorType() LocatorType }
@@ -255,12 +310,58 @@ type ExtentLocator struct {
 
 func (ExtentLocator) LocatorType() LocatorType { return LocatorExtent }
 
+type SQLiteLocator struct {
+	Object     ObjectID          `json:"object"`
+	Database   string            `json:"database,omitempty"`
+	Table      string            `json:"table"`
+	RowID      *int64            `json:"rowid,omitempty"`
+	PrimaryKey map[string]string `json:"primary_key,omitempty"`
+	Column     string            `json:"column,omitempty"`
+}
+
+func (SQLiteLocator) LocatorType() LocatorType { return LocatorSQLite }
+
 type JSONLocator struct {
 	Object  ObjectID `json:"object"`
 	Pointer string   `json:"pointer"`
 }
 
 func (JSONLocator) LocatorType() LocatorType { return LocatorJSON }
+
+type XMLLocator struct {
+	Object     ObjectID          `json:"object"`
+	XPath      string            `json:"xpath"`
+	Namespaces map[string]string `json:"namespaces,omitempty"`
+}
+
+func (XMLLocator) LocatorType() LocatorType { return LocatorXML }
+
+type ArchiveLocator struct {
+	Container   ObjectID `json:"container"`
+	RawName     []byte   `json:"raw_name,omitempty"`
+	DisplayName string   `json:"display_name"`
+	MemberIndex int      `json:"member_index"`
+}
+
+func (ArchiveLocator) LocatorType() LocatorType { return LocatorArchive }
+
+type RegistryLocator struct {
+	Hive      ObjectID `json:"hive"`
+	KeyPath   string   `json:"key_path"`
+	ValueName string   `json:"value_name,omitempty"`
+}
+
+func (RegistryLocator) LocatorType() LocatorType { return LocatorRegistry }
+
+type APILocator struct {
+	AcquisitionURI string `json:"acquisition_uri"`
+	AccountID      string `json:"account_id,omitempty"`
+	ResourceID     string `json:"resource_id,omitempty"`
+	RequestID      string `json:"request_id,omitempty"`
+	PageReference  string `json:"page_reference,omitempty"`
+}
+
+func (APILocator) LocatorType() LocatorType { return LocatorAPI }
 
 type CustomLocator struct {
 	Type string         `json:"type"`
@@ -308,15 +409,48 @@ const (
 )
 
 type ArtifactValue struct {
-	Property   string        `json:"property"`
-	Type       ValueType     `json:"type"`
-	Raw        string        `json:"raw,omitempty"`
-	Normalized any           `json:"normalized,omitempty"`
-	Unit       string        `json:"unit,omitempty"`
-	Language   string        `json:"language,omitempty"`
-	Confidence *float64      `json:"confidence,omitempty"`
-	Ordinal    int           `json:"ordinal,omitempty"`
-	Source     SourceLocator `json:"-"`
+	Property       string         `json:"property"`
+	SchemaURI      string         `json:"schema_uri,omitempty"`
+	Type           ValueType      `json:"type"`
+	Raw            string         `json:"raw,omitempty"`
+	Normalized     any            `json:"normalized,omitempty"`
+	Unit           string         `json:"unit,omitempty"`
+	Encoding       string         `json:"encoding,omitempty"`
+	Language       string         `json:"language,omitempty"`
+	Confidence     *float64       `json:"confidence,omitempty"`
+	Interpretation string         `json:"interpretation,omitempty"`
+	Ordinal        int            `json:"ordinal,omitempty"`
+	Source         SourceLocator  `json:"-"`
+	Temporal       *TemporalValue `json:"temporal,omitempty"`
+}
+
+type TimezoneBasis string
+
+const (
+	TimezoneExplicit TimezoneBasis = "explicit"
+	TimezoneAssumed  TimezoneBasis = "assumed"
+	TimezoneInferred TimezoneBasis = "inferred"
+	TimezoneUnknown  TimezoneBasis = "unknown"
+)
+
+// TemporalValue retains a timestamp interpretation without replacing the raw
+// representation in ArtifactValue.Raw. UTCStart/UTCEnd form an inclusive
+// uncertainty interval; an instant uses equal start and end values.
+type TemporalValue struct {
+	RawType          string          `json:"raw_type,omitempty"`
+	UTCStart         *time.Time      `json:"utc_start,omitempty"`
+	UTCEnd           *time.Time      `json:"utc_end,omitempty"`
+	OriginalNumeric  string          `json:"original_numeric,omitempty"`
+	EpochUnit        string          `json:"epoch_unit,omitempty"`
+	Timezone         string          `json:"timezone,omitempty"`
+	UTCOffsetSeconds *int            `json:"utc_offset_seconds,omitempty"`
+	TimezoneBasis    TimezoneBasis   `json:"timezone_basis,omitempty"`
+	Precision        string          `json:"precision,omitempty"`
+	SemanticRole     string          `json:"semantic_role,omitempty"`
+	Normalizer       *ToolDescriptor `json:"normalizer,omitempty"`
+	SourceClock      string          `json:"source_clock,omitempty"`
+	Confidence       *float64        `json:"confidence,omitempty"`
+	ClockSkew        string          `json:"clock_skew,omitempty"`
 }
 type ArtifactDraft struct {
 	Type        string          `json:"type"`
@@ -351,6 +485,8 @@ type AssertionRef struct {
 	Type               string      `json:"type"`
 	Body               string      `json:"body"`
 	Targets            []EntityRef `json:"targets"`
+	Confidence         *float64    `json:"confidence,omitempty"`
+	Supersedes         AssertionID `json:"supersedes,omitempty"`
 	GeneratingActivity ActivityID  `json:"generating_activity"`
 	CreatedRevision    int64       `json:"created_revision"`
 }
@@ -374,6 +510,9 @@ type FindingSpec struct {
 	Status         FindingStatus          `json:"status"`
 	Confidence     *float64               `json:"confidence,omitempty"`
 	Severity       string                 `json:"severity,omitempty"`
+	ReviewState    string                 `json:"review_state,omitempty"`
+	Assignees      []AgentID              `json:"assignees,omitempty"`
+	Vulnerability  *VulnerabilityDetails  `json:"vulnerability,omitempty"`
 	Members        map[string][]EntityRef `json:"members,omitempty"`
 	IdempotencyKey string                 `json:"-"`
 }
@@ -383,18 +522,47 @@ type FindingRevisionSpec struct {
 	Status           FindingStatus          `json:"status"`
 	Confidence       *float64               `json:"confidence,omitempty"`
 	Severity         string                 `json:"severity,omitempty"`
+	ReviewState      string                 `json:"review_state,omitempty"`
+	Assignees        []AgentID              `json:"assignees,omitempty"`
+	Vulnerability    *VulnerabilityDetails  `json:"vulnerability,omitempty"`
 	Members          map[string][]EntityRef `json:"members,omitempty"`
 	IdempotencyKey   string                 `json:"-"`
 }
+
+type AffectedComponent struct {
+	Name    string `json:"name"`
+	Version string `json:"version,omitempty"`
+	Commit  string `json:"commit,omitempty"`
+	Build   string `json:"build,omitempty"`
+}
+
+type VulnerabilityDetails struct {
+	AffectedComponents []AffectedComponent `json:"affected_components,omitempty"`
+	WeaknessIDs        []string            `json:"weakness_ids,omitempty"`
+	Preconditions      string              `json:"preconditions,omitempty"`
+	AttackSurface      string              `json:"attack_surface,omitempty"`
+	Reachability       string              `json:"reachability,omitempty"`
+	Reproduction       string              `json:"reproduction,omitempty"`
+	Environment        string              `json:"environment,omitempty"`
+	Impact             string              `json:"impact,omitempty"`
+	SeverityVector     string              `json:"severity_vector,omitempty"`
+	DisclosureState    string              `json:"disclosure_state,omitempty"`
+	ExternalIDs        map[string]string   `json:"external_ids,omitempty"`
+}
+
 type FindingRef struct {
-	ID              FindingID         `json:"id"`
-	Current         FindingRevisionID `json:"current_revision"`
-	Version         int               `json:"version"`
-	Title           string            `json:"title"`
-	Body            string            `json:"body"`
-	Status          FindingStatus     `json:"status"`
-	Severity        string            `json:"severity,omitempty"`
-	CreatedRevision int64             `json:"created_revision"`
+	ID              FindingID             `json:"id"`
+	Current         FindingRevisionID     `json:"current_revision"`
+	Version         int                   `json:"version"`
+	Title           string                `json:"title"`
+	Body            string                `json:"body"`
+	Status          FindingStatus         `json:"status"`
+	Confidence      *float64              `json:"confidence,omitempty"`
+	Severity        string                `json:"severity,omitempty"`
+	ReviewState     string                `json:"review_state,omitempty"`
+	Assignees       []AgentID             `json:"assignees,omitempty"`
+	Vulnerability   *VulnerabilityDetails `json:"vulnerability,omitempty"`
+	CreatedRevision int64                 `json:"created_revision"`
 }
 
 func (f FindingRef) EntityRef() EntityRef {
@@ -404,20 +572,32 @@ func (f FindingRef) EntityRef() EntityRef {
 type QueryOp string
 
 const (
-	QueryAll          QueryOp = "all"
-	QueryAnd          QueryOp = "and"
-	QueryOr           QueryOp = "or"
-	QueryNot          QueryOp = "not"
-	QueryKind         QueryOp = "kind"
-	QueryID           QueryOp = "id"
-	QueryPathGlob     QueryOp = "path_glob"
-	QueryHash         QueryOp = "hash"
-	QueryActivity     QueryOp = "activity"
-	QuerySession      QueryOp = "session"
-	QueryArtifactType QueryOp = "artifact_type"
-	QueryValue        QueryOp = "value"
-	QuerySelection    QueryOp = "selection"
-	QueryTree         QueryOp = "tree"
+	QueryAll           QueryOp = "all"
+	QueryAnd           QueryOp = "and"
+	QueryOr            QueryOp = "or"
+	QueryNot           QueryOp = "not"
+	QueryKind          QueryOp = "kind"
+	QueryID            QueryOp = "id"
+	QueryPathGlob      QueryOp = "path_glob"
+	QueryHash          QueryOp = "hash"
+	QueryActivity      QueryOp = "activity"
+	QuerySession       QueryOp = "session"
+	QueryArtifactType  QueryOp = "artifact_type"
+	QueryValue         QueryOp = "value"
+	QuerySelection     QueryOp = "selection"
+	QueryTree          QueryOp = "tree"
+	QueryTimeRange     QueryOp = "time_range"
+	QuerySchema        QueryOp = "schema"
+	QueryMediaType     QueryOp = "media_type"
+	QueryExtension     QueryOp = "extension"
+	QuerySizeRange     QueryOp = "size_range"
+	QueryAgent         QueryOp = "agent"
+	QueryTool          QueryOp = "tool"
+	QueryEvidence      QueryOp = "evidence"
+	QueryFinding       QueryOp = "finding"
+	QueryDescendant    QueryOp = "descendant"
+	QueryRevision      QueryOp = "revision"
+	QueryAssertionType QueryOp = "assertion_type"
 )
 
 type Query struct {
@@ -425,6 +605,11 @@ type Query struct {
 	Children []Query `json:"children,omitempty"`
 	Value    string  `json:"value,omitempty"`
 	Property string  `json:"property,omitempty"`
+	Start    string  `json:"start,omitempty"`
+	End      string  `json:"end,omitempty"`
+	Role     string  `json:"role,omitempty"`
+	Min      int64   `json:"min,omitempty"`
+	Max      int64   `json:"max,omitempty"`
 }
 
 func All() Query                             { return Query{Op: QueryAll} }
@@ -443,10 +628,45 @@ func ValueEquals(property, value string) Query {
 }
 func InSelection(id SelectionID) Query { return Query{Op: QuerySelection, Value: string(id)} }
 func InTree(id TreeID) Query           { return Query{Op: QueryTree, Value: string(id)} }
+func TimeOverlaps(property string, start, end time.Time, semanticRole string) Query {
+	return Query{Op: QueryTimeRange, Property: property, Start: start.UTC().Format(time.RFC3339Nano), End: end.UTC().Format(time.RFC3339Nano), Role: semanticRole}
+}
+func SchemaIs(uri string) Query          { return Query{Op: QuerySchema, Value: uri} }
+func MediaTypeIs(mediaType string) Query { return Query{Op: QueryMediaType, Value: mediaType} }
+func ExtensionIs(extension string) Query { return Query{Op: QueryExtension, Value: extension} }
+func SizeBetween(minimum, maximum int64) Query {
+	return Query{Op: QuerySizeRange, Min: minimum, Max: maximum}
+}
+func ProducedByAgent(id AgentID) Query { return Query{Op: QueryAgent, Value: string(id)} }
+func ProducedByTool(name, version string) Query {
+	return Query{Op: QueryTool, Value: name, Role: version}
+}
+func InEvidence(id EvidenceID) Query     { return Query{Op: QueryEvidence, Value: string(id)} }
+func InFinding(id FindingID) Query       { return Query{Op: QueryFinding, Value: string(id)} }
+func DescendsFrom(entityID string) Query { return Query{Op: QueryDescendant, Value: entityID} }
+func CreatedAtRevision(minimum, maximum int64) Query {
+	return Query{Op: QueryRevision, Min: minimum, Max: maximum}
+}
+func AssertionTypeIs(assertionType string) Query {
+	return Query{Op: QueryAssertionType, Value: assertionType}
+}
 
 type QueryResult struct {
 	Revision int64       `json:"revision"`
 	Entities []EntityRef `json:"entities"`
+}
+
+type QueryPageSpec struct {
+	Query    Query     `json:"query"`
+	Revision int64     `json:"revision,omitempty"`
+	After    EntityRef `json:"after,omitempty"`
+	Limit    int       `json:"limit,omitempty"`
+}
+
+type QueryPageResult struct {
+	Revision int64       `json:"revision"`
+	Entities []EntityRef `json:"entities"`
+	Next     EntityRef   `json:"next,omitempty"`
 }
 type FreezeSpec struct {
 	Name           string `json:"name"`
@@ -492,18 +712,29 @@ const (
 )
 
 type ProjectionSpec struct {
-	Selection      SelectionID   `json:"selection"`
-	Closure        ClosurePolicy `json:"closure"`
-	Layout         Layout        `json:"layout"`
-	Include        Include       `json:"include"`
-	IdempotencyKey string        `json:"-"`
+	Selection      SelectionID           `json:"selection"`
+	Closure        ClosurePolicy         `json:"closure"`
+	Layout         Layout                `json:"layout"`
+	Include        Include               `json:"include"`
+	Kinds          []EntityKind          `json:"kinds,omitempty"`
+	Exclusions     []ProjectionExclusion `json:"exclusions,omitempty"`
+	MaxFiles       int                   `json:"max_files,omitempty"`
+	MaxBytes       int64                 `json:"max_bytes,omitempty"`
+	IdempotencyKey string                `json:"-"`
 }
+
+type ProjectionExclusion struct {
+	Entity EntityRef `json:"entity"`
+	Reason string    `json:"reason"`
+}
+
 type Projection struct {
-	ID              ProjectionID   `json:"id"`
-	Spec            ProjectionSpec `json:"spec"`
-	Members         []EntityRef    `json:"members"`
-	Digest          string         `json:"digest"`
-	CreatedRevision int64          `json:"created_revision"`
+	ID              ProjectionID          `json:"id"`
+	Spec            ProjectionSpec        `json:"spec"`
+	Members         []EntityRef           `json:"members"`
+	Excluded        []ProjectionExclusion `json:"excluded,omitempty"`
+	Digest          string                `json:"digest"`
+	CreatedRevision int64                 `json:"created_revision"`
 }
 
 func (p Projection) EntityRef() EntityRef { return EntityRef{ID: string(p.ID), Kind: EntityProjection} }
@@ -544,6 +775,37 @@ type Materialization struct {
 	CreatedRevision int64             `json:"created_revision"`
 }
 
+// RunSpec describes a wrapped local execution. Command is invoked directly,
+// never through a shell. OutputPaths are relative to the workspace output
+// directory and are the only result files imported into the case.
+type RunSpec struct {
+	Projection         ProjectionID      `json:"projection"`
+	Command            string            `json:"command"`
+	Arguments          []string          `json:"arguments,omitempty"`
+	WorkingDirectory   string            `json:"working_directory,omitempty"`
+	Environment        map[string]string `json:"environment,omitempty"`
+	InheritEnvironment []string          `json:"inherit_environment,omitempty"`
+	OutputPaths        []string          `json:"output_paths,omitempty"`
+	Tool               *ToolDescriptor   `json:"tool,omitempty"`
+	Config             map[string]any    `json:"config,omitempty"`
+	Label              string            `json:"label,omitempty"`
+	Sandbox            string            `json:"sandbox,omitempty"`
+	MaxLogBytes        int64             `json:"max_log_bytes,omitempty"`
+	MaxOutputFiles     int               `json:"max_output_files,omitempty"`
+	MaxOutputBytes     int64             `json:"max_output_bytes,omitempty"`
+}
+
+type RunResult struct {
+	Activity        ActivityID      `json:"activity"`
+	Materialization Materialization `json:"materialization"`
+	Outputs         []ObjectRef     `json:"outputs,omitempty"`
+	Stdout          ObjectRef       `json:"stdout"`
+	Stderr          ObjectRef       `json:"stderr"`
+	Outcome         Outcome         `json:"outcome"`
+	InputCheck      VerifyReport    `json:"input_check"`
+	LogsTruncated   bool            `json:"logs_truncated,omitempty"`
+}
+
 type VerifyMode string
 
 const (
@@ -580,10 +842,11 @@ type ByteSearchSpec struct {
 	Limit        int
 }
 type ByteSearchHit struct {
-	Object  ObjectID `json:"object"`
-	Offset  int64    `json:"offset"`
-	Length  int      `json:"length"`
-	Context []byte   `json:"context,omitempty"`
+	Object        ObjectID `json:"object"`
+	Offset        int64    `json:"offset"`
+	Length        int      `json:"length"`
+	Context       []byte   `json:"context,omitempty"`
+	ContextSHA256 string   `json:"context_sha256,omitempty"`
 }
 type TextSearchHit struct {
 	Artifact ArtifactID `json:"artifact"`
@@ -591,17 +854,105 @@ type TextSearchHit struct {
 	Text     string     `json:"text"`
 }
 
+type MetadataField string
+
+const (
+	MetadataDisplayName MetadataField = "display_name"
+	MetadataMediaType   MetadataField = "media_type"
+	MetadataPath        MetadataField = "path"
+	MetadataValueRaw    MetadataField = "value.raw"
+	MetadataValueNorm   MetadataField = "value.normalized"
+	MetadataFinding     MetadataField = "finding"
+	MetadataAssertion   MetadataField = "assertion"
+)
+
+type MetadataSearchSpec struct {
+	Selection      SelectionID     `json:"selection,omitempty"`
+	Literal        string          `json:"literal,omitempty"`
+	Regexp         string          `json:"regexp,omitempty"`
+	Fields         []MetadataField `json:"fields,omitempty"`
+	CaseSensitive  bool            `json:"case_sensitive,omitempty"`
+	CandidateLimit int             `json:"candidate_limit,omitempty"`
+	Limit          int             `json:"limit,omitempty"`
+	MaxResultBytes int             `json:"max_result_bytes,omitempty"`
+}
+
+type MetadataSearchHit struct {
+	Entity   EntityRef     `json:"entity"`
+	Field    MetadataField `json:"field"`
+	Property string        `json:"property,omitempty"`
+	Value    string        `json:"value"`
+	Source   SourceLocator `json:"-"`
+}
+
+type MetadataSearchResult struct {
+	Hits              []MetadataSearchHit `json:"hits"`
+	CandidatesScanned int                 `json:"candidates_scanned"`
+	Truncated         bool                `json:"truncated"`
+}
+
+type SavedByteSearchSpec struct {
+	Name           string         `json:"name"`
+	Search         ByteSearchSpec `json:"search"`
+	IdempotencyKey string         `json:"-"`
+}
+
+type SavedSearch struct {
+	Activity        ActivityID    `json:"activity"`
+	Selection       Selection     `json:"selection"`
+	Hits            []ArtifactRef `json:"hits"`
+	CreatedRevision int64         `json:"created_revision"`
+}
+
 type ActivityInfo struct {
-	ID          ActivityID    `json:"id"`
-	Session     SessionID     `json:"session,omitempty"`
-	Agent       AgentID       `json:"agent"`
-	Type        ActivityType  `json:"type"`
-	Label       string        `json:"label"`
-	CaptureMode CaptureMode   `json:"capture_mode"`
-	State       ActivityState `json:"state"`
-	StartedAt   time.Time     `json:"started_at"`
-	FinishedAt  *time.Time    `json:"finished_at,omitempty"`
-	Outcome     *Outcome      `json:"outcome,omitempty"`
+	ID                 ActivityID           `json:"id"`
+	Session            SessionID            `json:"session,omitempty"`
+	Agent              AgentID              `json:"agent"`
+	Type               ActivityType         `json:"type"`
+	Label              string               `json:"label"`
+	CaptureMode        CaptureMode          `json:"capture_mode"`
+	Parent             ActivityID           `json:"parent,omitempty"`
+	Agents             []ActivityAgent      `json:"agents,omitempty"`
+	Tool               *ToolDescriptor      `json:"tool,omitempty"`
+	ConfigDigest       string               `json:"config_digest,omitempty"`
+	Execution          *ExecutionDescriptor `json:"execution,omitempty"`
+	TimeSource         string               `json:"time_source,omitempty"`
+	ReportedStartedAt  *time.Time           `json:"reported_started_at,omitempty"`
+	ReportedFinishedAt *time.Time           `json:"reported_finished_at,omitempty"`
+	State              ActivityState        `json:"state"`
+	StartedAt          time.Time            `json:"started_at"`
+	FinishedAt         *time.Time           `json:"finished_at,omitempty"`
+	Outcome            *Outcome             `json:"outcome,omitempty"`
+}
+
+type CustodyTransferSpec struct {
+	Item            EntityRef      `json:"item"`
+	FromAgent       AgentID        `json:"from_agent,omitempty"`
+	ToAgent         AgentID        `json:"to_agent,omitempty"`
+	FromLocation    string         `json:"from_location,omitempty"`
+	ToLocation      string         `json:"to_location,omitempty"`
+	Purpose         string         `json:"purpose,omitempty"`
+	ReferenceNumber string         `json:"reference_number,omitempty"`
+	OccurredAt      time.Time      `json:"occurred_at"`
+	Acknowledgement map[string]any `json:"acknowledgement,omitempty"`
+	Signature       []byte         `json:"signature,omitempty"`
+	IdempotencyKey  string         `json:"-"`
+}
+
+type CustodyEvent struct {
+	Activity        ActivityID     `json:"activity"`
+	Item            EntityRef      `json:"item"`
+	FromAgent       AgentID        `json:"from_agent,omitempty"`
+	ToAgent         AgentID        `json:"to_agent,omitempty"`
+	FromLocation    string         `json:"from_location,omitempty"`
+	ToLocation      string         `json:"to_location,omitempty"`
+	Purpose         string         `json:"purpose,omitempty"`
+	ReferenceNumber string         `json:"reference_number,omitempty"`
+	OccurredAt      time.Time      `json:"occurred_at"`
+	RecordedAt      time.Time      `json:"recorded_at"`
+	Acknowledgement map[string]any `json:"acknowledgement,omitempty"`
+	Signature       []byte         `json:"signature,omitempty"`
+	CreatedRevision int64          `json:"created_revision"`
 }
 type ProvenanceEdge struct {
 	Activity  ActivityID `json:"activity"`
@@ -621,22 +972,54 @@ type MarkdownSpec struct {
 	Writer                   io.Writer
 	IncludeHashes            bool
 	IncludeProvenanceSummary bool
+	Materialization          MaterializationID
 }
 type JSONLSpec struct {
 	Selection SelectionID
 	Writer    io.Writer
 }
 type BagItSpec struct {
-	Selection   SelectionID
-	Destination string
-	Name        string
+	Selection       SelectionID            `json:"selection"`
+	Destination     string                 `json:"destination"`
+	Name            string                 `json:"name"`
+	Closure         ClosurePolicy          `json:"closure,omitempty"`
+	Exclusions      []DeliverableExclusion `json:"exclusions,omitempty"`
+	RedactionPolicy string                 `json:"redaction_policy,omitempty"`
+	Recipient       string                 `json:"recipient,omitempty"`
+	Purpose         string                 `json:"purpose,omitempty"`
+	Version         string                 `json:"version,omitempty"`
+	Predecessor     DeliverableID          `json:"predecessor,omitempty"`
+	IdempotencyKey  string                 `json:"-"`
 }
+
+type DeliverableExclusion struct {
+	Entity EntityRef `json:"entity"`
+	Reason string    `json:"reason"`
+}
+
+type DeliverableMember struct {
+	Entity      EntityRef `json:"entity"`
+	Disposition string    `json:"disposition"`
+	Reason      string    `json:"reason,omitempty"`
+	EmittedPath string    `json:"emitted_path,omitempty"`
+	Blob        BlobRef   `json:"blob,omitempty"`
+}
+
 type Deliverable struct {
-	ID              DeliverableID `json:"id"`
-	Selection       SelectionID   `json:"selection"`
-	Path            string        `json:"path"`
-	SHA256          string        `json:"sha256"`
-	CreatedRevision int64         `json:"created_revision"`
+	ID              DeliverableID       `json:"id"`
+	Selection       SelectionID         `json:"selection"`
+	Path            string              `json:"path"`
+	SHA256          string              `json:"sha256"`
+	Format          string              `json:"format"`
+	Closure         ClosurePolicy       `json:"closure,omitempty"`
+	Manifest        ObjectRef           `json:"manifest"`
+	Members         []DeliverableMember `json:"members,omitempty"`
+	Recipient       string              `json:"recipient,omitempty"`
+	Purpose         string              `json:"purpose,omitempty"`
+	RedactionPolicy string              `json:"redaction_policy,omitempty"`
+	Version         string              `json:"version,omitempty"`
+	Predecessor     DeliverableID       `json:"predecessor,omitempty"`
+	CreatedRevision int64               `json:"created_revision"`
 }
 
 func (d Deliverable) EntityRef() EntityRef {
@@ -654,7 +1037,37 @@ type SnapshotSpec struct {
 	Name        string `json:"name,omitempty"`
 }
 type RestoreSpec struct {
-	Source string `json:"source"`
+	Source  string `json:"source"`
+	Migrate bool   `json:"migrate,omitempty"`
+}
+
+type RecoveryFile struct {
+	Path     string    `json:"path"`
+	Size     int64     `json:"size"`
+	Modified time.Time `json:"modified"`
+	Blob     BlobRef   `json:"blob,omitempty"`
+}
+
+type RecoveryCaseDirectory struct {
+	ID            CaseID `json:"id,omitempty"`
+	Path          string `json:"path"`
+	RegistryState string `json:"registry_state,omitempty"`
+	Valid         bool   `json:"valid"`
+	CanComplete   bool   `json:"can_complete"`
+	Detail        string `json:"detail,omitempty"`
+}
+
+type RepositoryRecoveryReport struct {
+	Creating     []RecoveryCaseDirectory `json:"creating,omitempty"`
+	Unregistered []RecoveryCaseDirectory `json:"unregistered,omitempty"`
+	Issues       []RecoveryCaseDirectory `json:"issues,omitempty"`
+}
+
+type CaseRecoveryReport struct {
+	Case              CaseID         `json:"case"`
+	StagingFiles      []RecoveryFile `json:"staging_files,omitempty"`
+	OrphanBlobs       []RecoveryFile `json:"orphan_blobs,omitempty"`
+	RunningActivities []ActivityInfo `json:"running_activities,omitempty"`
 }
 type PortableBlob struct {
 	Blob BlobRef `json:"blob"`
@@ -663,6 +1076,7 @@ type PortableBlob struct {
 }
 type PortableCaseManifest struct {
 	Format        int            `json:"format"`
+	SchemaVersion int            `json:"schema_version,omitempty"`
 	Case          CaseID         `json:"case"`
 	Name          string         `json:"name"`
 	Description   string         `json:"description,omitempty"`
@@ -717,6 +1131,42 @@ type Parser interface {
 	Descriptor() ParserDescriptor
 	Probe(context.Context, ObjectReader) (ProbeResult, error)
 	Parse(context.Context, ParseRequest, Sink) error
+}
+
+type ParserFactory interface {
+	New() Parser
+}
+
+type ParserFactoryFunc func() Parser
+
+func (f ParserFactoryFunc) New() Parser { return f() }
+
+type ParseOptions struct {
+	Config            map[string]any `json:"config,omitempty"`
+	Probe             bool           `json:"probe,omitempty"`
+	MinimumConfidence float64        `json:"minimum_confidence,omitempty"`
+	UseCache          bool           `json:"use_cache,omitempty"`
+}
+
+type ParseResult struct {
+	Input      ObjectID         `json:"input"`
+	Parser     ParserDescriptor `json:"parser"`
+	Probe      *ProbeResult     `json:"probe,omitempty"`
+	Activity   ActivityID       `json:"activity,omitempty"`
+	Outputs    []EntityRef      `json:"outputs,omitempty"`
+	Reused     bool             `json:"reused,omitempty"`
+	ReusedFrom ActivityID       `json:"reused_from,omitempty"`
+	Error      string           `json:"error,omitempty"`
+	Err        error            `json:"-"`
+}
+
+type ParseManySpec struct {
+	Inputs            []ObjectRef    `json:"inputs"`
+	Config            map[string]any `json:"config,omitempty"`
+	Probe             bool           `json:"probe,omitempty"`
+	MinimumConfidence float64        `json:"minimum_confidence,omitempty"`
+	Concurrency       int            `json:"concurrency,omitempty"`
+	UseCache          bool           `json:"use_cache,omitempty"`
 }
 type ObjectReader interface {
 	io.ReaderAt

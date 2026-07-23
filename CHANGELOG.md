@@ -11,6 +11,31 @@ Initial public release.
 - Added immutable SHA-256 storage, regular-file and source-tree imports,
   provenance, typed queries, frozen selections, deterministic projections,
   exports, snapshots, and integrity verification.
+- Added typed SQLite, JSON, XML, archive, registry, and API locators;
+  uncertainty-aware temporal values; bounded metadata queries; and traceable
+  saved byte-search results.
+- Added multi-agent activity attribution, external-execution metadata, parent
+  activities, append-only custody transfers, and revision-stable idempotent
+  replays.
+- Added parser probing, isolated per-input parser factories, bounded concurrent
+  parsing, ordered results, durable partial outputs on parser failure, and
+  explicit deterministic parser-output reuse.
+- Added read-only recovery inspection, explicit case re-registration and
+  interruption handling, plus versioned BagIt deliverables with closure,
+  exclusions, policy metadata, membership manifests, and predecessor lineage.
+- Added projection exclusion records and semantic verification for entity
+  invariants, acquisition hashes, and source-tree manifests.
+- Added extended typed query predicates and richer vulnerability-finding
+  metadata, including identifiers, references, affected targets, confidence,
+  and analyst attribution.
+- Added explicit leased schema migration with verified online backups,
+  transactional version steps, and retained rollback artifacts.
+- Added wrapped experiment execution with protected inputs, safe working paths,
+  allowlisted environments, bounded stdout/stderr capture, declared output
+  ingestion, cancellation, and durable outcomes.
+- Added revision-pinned query pages, rich projection metadata/provenance/finding
+  sidecars, source-tree resource limits and raw path retention, and preflighted
+  old-schema portable restore with stable IDs.
 - Added concurrent, multi-process, crash-boundary, corruption, fuzz, and race tests.
 - Added architecture decision records, CI, release automation, and security policy.
 

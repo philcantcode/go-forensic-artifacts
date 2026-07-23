@@ -107,6 +107,15 @@ func Open(ctx context.Context, cfg Config) (*Repository, error) {
 		db.Close()
 		return nil, mapSQLError(err)
 	}
+	var storedFormat int
+	if err = db.QueryRowContext(ctx, "SELECT format_version FROM repository_info WHERE singleton=1").Scan(&storedFormat); err != nil {
+		db.Close()
+		return nil, mapSQLError(err)
+	}
+	if storedFormat != RepositoryFormat {
+		db.Close()
+		return nil, fmt.Errorf("%w: repository catalog format %d", ErrUnsupportedStorage, storedFormat)
+	}
 	return &Repository{root: root, db: db, busy: cfg.BusyTimeout, defaultAgent: cfg.DefaultAgent}, nil
 }
 
@@ -285,20 +294,27 @@ func (r *Repository) OpenCase(ctx context.Context, selector CaseSelector) (*Case
 		return nil, err
 	}
 	var id CaseID
+	var state string
 	var row *sql.Row
 	if selector.id != "" {
-		row = r.db.QueryRowContext(ctx, "SELECT id FROM cases WHERE id=? AND state='active'", selector.id)
+		row = r.db.QueryRowContext(ctx, "SELECT id,state FROM cases WHERE id=?", selector.id)
 	} else {
 		lookup, err := normalizeCaseName(selector.name)
 		if err != nil {
 			return nil, err
 		}
-		row = r.db.QueryRowContext(ctx, "SELECT id FROM cases WHERE lookup_key=? AND state='active'", lookup)
+		row = r.db.QueryRowContext(ctx, "SELECT id,state FROM cases WHERE lookup_key=?", lookup)
 	}
-	if err := row.Scan(&id); errors.Is(err, sql.ErrNoRows) {
+	if err := row.Scan(&id, &state); errors.Is(err, sql.ErrNoRows) {
 		return nil, ErrNotFound
 	} else if err != nil {
 		return nil, mapSQLError(err)
+	}
+	if state == "maintenance" {
+		return nil, fmt.Errorf("%w: case is under maintenance", ErrBusy)
+	}
+	if state != "active" {
+		return nil, ErrNotFound
 	}
 	root := filepath.Join(r.root, "cases", string(id))
 	b, err := os.ReadFile(filepath.Join(root, "case.json"))
@@ -403,7 +419,7 @@ func (c *Case) ensureAgent(ctx context.Context, spec AgentSpec) (AgentRef, error
 		return a, e
 	}
 	a = AgentRef{ID: id, Kind: spec.Kind, Name: spec.Name}
-	_, e = c.mutate(ctx, c.defaultAgent.ID, "", "agent.create", "", []string{string(id)}, func(tx *sql.Tx, rev int64) error {
+	_, e = c.mutate(ctx, id, "", "agent.create", "", []string{string(id)}, func(tx *sql.Tx, rev int64) error {
 		_, e := tx.ExecContext(ctx, "INSERT INTO agents(id,kind,name,created_at) VALUES(?,?,?,?)", id, spec.Kind, spec.Name, time.Now().UTC().Format(time.RFC3339Nano))
 		return e
 	})
@@ -411,6 +427,15 @@ func (c *Case) ensureAgent(ctx context.Context, spec AgentSpec) (AgentRef, error
 		return c.ensureAgent(ctx, spec)
 	}
 	return a, e
+}
+
+// RegisterAgent returns the immutable agent identity for kind/name, creating it
+// when necessary. Repeated registration of the same pair is safe.
+func (c *Case) RegisterAgent(ctx context.Context, spec AgentSpec) (AgentRef, error) {
+	if err := c.checkOpen(); err != nil {
+		return AgentRef{}, err
+	}
+	return c.ensureAgent(ctx, spec)
 }
 
 func writeJSONAtomic(path string, v any) error {

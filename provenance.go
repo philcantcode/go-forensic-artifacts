@@ -11,10 +11,10 @@ import (
 
 func (c *Case) Activity(ctx context.Context, id ActivityID) (ActivityInfo, error) {
 	var a ActivityInfo
-	var session sql.NullString
+	var session, parent sql.NullString
 	var started string
-	var finished, outcome sql.NullString
-	err := c.db.QueryRowContext(ctx, "SELECT id,session_id,agent_id,type,label,capture_mode,state,started_at,finished_at,outcome_json FROM activities WHERE id=?", id).Scan(&a.ID, &session, &a.Agent, &a.Type, &a.Label, &a.CaptureMode, &a.State, &started, &finished, &outcome)
+	var finished, outcome, toolJSON, executionJSON, reportedStart, reportedEnd sql.NullString
+	err := c.db.QueryRowContext(ctx, "SELECT id,session_id,agent_id,type,label,capture_mode,parent_activity_id,tool_json,config_digest,execution_json,time_source,reported_started_at,reported_finished_at,state,started_at,finished_at,outcome_json FROM activities WHERE id=?", id).Scan(&a.ID, &session, &a.Agent, &a.Type, &a.Label, &a.CaptureMode, &parent, &toolJSON, &a.ConfigDigest, &executionJSON, &a.TimeSource, &reportedStart, &reportedEnd, &a.State, &started, &finished, &outcome)
 	if errors.Is(err, sql.ErrNoRows) {
 		return a, ErrNotFound
 	}
@@ -22,6 +22,35 @@ func (c *Case) Activity(ctx context.Context, id ActivityID) (ActivityInfo, error
 		return a, mapSQLError(err)
 	}
 	a.Session = SessionID(session.String)
+	a.Parent = ActivityID(parent.String)
+	if toolJSON.Valid && toolJSON.String != "null" {
+		var tool ToolDescriptor
+		if json.Unmarshal([]byte(toolJSON.String), &tool) != nil {
+			return a, ErrIntegrity
+		}
+		a.Tool = &tool
+	}
+	if executionJSON.Valid && executionJSON.String != "null" {
+		var execution ExecutionDescriptor
+		if json.Unmarshal([]byte(executionJSON.String), &execution) != nil {
+			return a, ErrIntegrity
+		}
+		a.Execution = &execution
+	}
+	if reportedStart.Valid {
+		v, parseErr := time.Parse(time.RFC3339Nano, reportedStart.String)
+		if parseErr != nil {
+			return a, ErrIntegrity
+		}
+		a.ReportedStartedAt = &v
+	}
+	if reportedEnd.Valid {
+		v, parseErr := time.Parse(time.RFC3339Nano, reportedEnd.String)
+		if parseErr != nil {
+			return a, ErrIntegrity
+		}
+		a.ReportedFinishedAt = &v
+	}
 	a.StartedAt, _ = time.Parse(time.RFC3339Nano, started)
 	if finished.Valid {
 		v, _ := time.Parse(time.RFC3339Nano, finished.String)
@@ -32,6 +61,21 @@ func (c *Case) Activity(ctx context.Context, id ActivityID) (ActivityInfo, error
 		if json.Unmarshal([]byte(outcome.String), &v) == nil {
 			a.Outcome = &v
 		}
+	}
+	rows, err := c.db.QueryContext(ctx, "SELECT agent_id,role FROM activity_agents WHERE activity_id=? ORDER BY role,agent_id", id)
+	if err != nil {
+		return a, mapSQLError(err)
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var associated ActivityAgent
+		if err = rows.Scan(&associated.Agent, &associated.Role); err != nil {
+			return a, err
+		}
+		a.Agents = append(a.Agents, associated)
+	}
+	if err = rows.Err(); err != nil {
+		return a, err
 	}
 	return a, nil
 }

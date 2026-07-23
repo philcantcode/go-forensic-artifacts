@@ -36,6 +36,15 @@ func (s *Session) CreateProjection(ctx context.Context, spec ProjectionSpec) (Pr
 	if spec.Include == 0 {
 		spec.Include = IncludeBytes | IncludeMetadata
 	}
+	if spec.MaxFiles <= 0 {
+		spec.MaxFiles = 100000
+	}
+	if spec.MaxBytes <= 0 {
+		spec.MaxBytes = 1 << 40
+	}
+	if spec.MaxFiles > 1000000 || spec.MaxBytes > 1<<50 {
+		return Projection{}, fmt.Errorf("%w: projection resource limit is too large", ErrInvalid)
+	}
 	selection, err := s.caseRef.Selection(ctx, spec.Selection)
 	if err != nil {
 		return Projection{}, err
@@ -44,6 +53,42 @@ func (s *Session) CreateProjection(ctx context.Context, spec ProjectionSpec) (Pr
 	if err != nil {
 		return Projection{}, err
 	}
+	allowedKinds := map[EntityKind]bool{}
+	for _, kind := range spec.Kinds {
+		if kind == "" {
+			return Projection{}, fmt.Errorf("%w: empty projection entity kind", ErrInvalid)
+		}
+		allowedKinds[kind] = true
+	}
+	explicitExclusions := map[string]ProjectionExclusion{}
+	for _, exclusion := range spec.Exclusions {
+		if exclusion.Entity.ID == "" || strings.TrimSpace(exclusion.Reason) == "" || explicitExclusions[exclusion.Entity.ID].Entity.ID != "" {
+			return Projection{}, fmt.Errorf("%w: projection exclusions require unique entity IDs and reasons", ErrInvalid)
+		}
+		explicitExclusions[exclusion.Entity.ID] = exclusion
+	}
+	var included []projectionMember
+	var excluded []ProjectionExclusion
+	foundExplicit := map[string]bool{}
+	for _, member := range members {
+		if exclusion, ok := explicitExclusions[member.Ref.ID]; ok {
+			exclusion.Entity = member.Ref
+			excluded = append(excluded, exclusion)
+			foundExplicit[member.Ref.ID] = true
+			continue
+		}
+		if len(allowedKinds) != 0 && !allowedKinds[member.Ref.Kind] {
+			excluded = append(excluded, ProjectionExclusion{Entity: member.Ref, Reason: "entity kind excluded by projection filter"})
+			continue
+		}
+		included = append(included, member)
+	}
+	for id := range explicitExclusions {
+		if !foundExplicit[id] {
+			return Projection{}, fmt.Errorf("%w: excluded entity %s is not in resolved closure", ErrInvalid, id)
+		}
+	}
+	members = included
 	id, err := newProjectionID()
 	if err != nil {
 		return Projection{}, err
@@ -60,7 +105,7 @@ func (s *Session) CreateProjection(ctx context.Context, spec ProjectionSpec) (Pr
 	for i := range members {
 		outMembers[i] = members[i].Ref
 	}
-	p := Projection{ID: id, Spec: spec, Members: outMembers, Digest: fp}
+	p := Projection{ID: id, Spec: spec, Members: outMembers, Excluded: excluded, Digest: fp}
 	_, err = s.caseRef.mutate(ctx, s.info.Agent.ID, s.ID(), "projection.create", fp, []string{string(id)}, func(tx *sql.Tx, rev int64) error {
 		if spec.IdempotencyKey != "" {
 			var old Projection
@@ -70,7 +115,7 @@ func (s *Session) CreateProjection(ctx context.Context, spec ProjectionSpec) (Pr
 			}
 			if ok {
 				p = old
-				return nil
+				return errIdempotentReplay
 			}
 		}
 		now := time.Now().UTC().Format(time.RFC3339Nano)
@@ -89,6 +134,11 @@ func (s *Session) CreateProjection(ctx context.Context, spec ProjectionSpec) (Pr
 		}
 		for i, m := range members {
 			if _, e := tx.ExecContext(ctx, "INSERT INTO projection_members(projection_id,ordinal,entity_id,kind,reason) VALUES(?,?,?,?,?)", id, i, m.Ref.ID, m.Ref.Kind, m.Reason); e != nil {
+				return e
+			}
+		}
+		for i, exclusion := range excluded {
+			if _, e := tx.ExecContext(ctx, "INSERT INTO projection_exclusions(projection_id,ordinal,entity_id,kind,reason) VALUES(?,?,?,?,?)", id, i, exclusion.Entity.ID, exclusion.Entity.Kind, exclusion.Reason); e != nil {
 				return e
 			}
 		}
@@ -240,7 +290,25 @@ func (c *Case) Projection(ctx context.Context, id ProjectionID) (Projection, err
 		}
 		p.Members = append(p.Members, e)
 	}
-	return p, rows.Err()
+	if err = rows.Err(); err != nil {
+		return p, err
+	}
+	if err = rows.Close(); err != nil {
+		return p, err
+	}
+	excludedRows, err := c.db.QueryContext(ctx, "SELECT entity_id,kind,reason FROM projection_exclusions WHERE projection_id=? ORDER BY ordinal", id)
+	if err != nil {
+		return p, err
+	}
+	defer excludedRows.Close()
+	for excludedRows.Next() {
+		var exclusion ProjectionExclusion
+		if err = excludedRows.Scan(&exclusion.Entity.ID, &exclusion.Entity.Kind, &exclusion.Reason); err != nil {
+			return p, err
+		}
+		p.Excluded = append(p.Excluded, exclusion)
+	}
+	return p, excludedRows.Err()
 }
 
 func (s *Session) Materialize(ctx context.Context, id ProjectionID, target DirectoryTarget) (Materialization, error) {
@@ -250,6 +318,12 @@ func (s *Session) Materialize(ctx context.Context, id ProjectionID, target Direc
 	p, err := s.caseRef.Projection(ctx, id)
 	if err != nil {
 		return Materialization{}, err
+	}
+	if p.Spec.MaxFiles <= 0 {
+		p.Spec.MaxFiles = 100000
+	}
+	if p.Spec.MaxBytes <= 0 {
+		p.Spec.MaxBytes = 1 << 40
 	}
 	selection, err := s.caseRef.Selection(ctx, p.Spec.Selection)
 	if err != nil {
@@ -296,7 +370,9 @@ func (s *Session) Materialize(ctx context.Context, id ProjectionID, target Direc
 	}()
 	manifest := ProjectionManifest{Format: 1, Case: s.caseRef.id, Projection: id, Selection: p.Spec.Selection, Revision: selection.Revision, SpecDigest: p.Digest}
 	used := map[string]bool{}
+	emittedFiles := 0
 	var total int64
+	emittedFindings := map[FindingRevisionID]bool{}
 	rows, err := s.caseRef.db.QueryContext(ctx, "SELECT entity_id,kind,reason FROM projection_members WHERE projection_id=? ORDER BY ordinal", id)
 	if err != nil {
 		return Materialization{}, err
@@ -316,7 +392,29 @@ func (s *Session) Materialize(ctx context.Context, id ProjectionID, target Direc
 				if file, err = writeEntitySidecar(ctx, s.caseRef, partial, entity); err != nil {
 					return Materialization{}, err
 				}
-				manifest.Files = append(manifest.Files, file)
+				if err = addProjectionSupportFile(&manifest, file, &emittedFiles, &total, p.Spec); err != nil {
+					return Materialization{}, err
+				}
+			}
+			if p.Spec.Include&IncludeProvenance != 0 {
+				file, writeErr := writeProvenanceSidecar(ctx, s.caseRef, partial, entity)
+				if writeErr != nil {
+					return Materialization{}, writeErr
+				}
+				if err = addProjectionSupportFile(&manifest, file, &emittedFiles, &total, p.Spec); err != nil {
+					return Materialization{}, err
+				}
+			}
+			if p.Spec.Include&IncludeFindings != 0 {
+				files, writeErr := writeFindingSidecars(ctx, s.caseRef, partial, entity, emittedFindings)
+				if writeErr != nil {
+					return Materialization{}, writeErr
+				}
+				for _, file := range files {
+					if err = addProjectionSupportFile(&manifest, file, &emittedFiles, &total, p.Spec); err != nil {
+						return Materialization{}, err
+					}
+				}
 			}
 			continue
 		}
@@ -328,18 +426,40 @@ func (s *Session) Materialize(ctx context.Context, id ProjectionID, target Direc
 			if file, err = writeEntitySidecar(ctx, s.caseRef, partial, entity); err != nil {
 				return Materialization{}, err
 			}
-			manifest.Files = append(manifest.Files, file)
+			if err = addProjectionSupportFile(&manifest, file, &emittedFiles, &total, p.Spec); err != nil {
+				return Materialization{}, err
+			}
+		}
+		if p.Spec.Include&IncludeProvenance != 0 {
+			file, writeErr := writeProvenanceSidecar(ctx, s.caseRef, partial, entity)
+			if writeErr != nil {
+				return Materialization{}, writeErr
+			}
+			if err = addProjectionSupportFile(&manifest, file, &emittedFiles, &total, p.Spec); err != nil {
+				return Materialization{}, err
+			}
+		}
+		if p.Spec.Include&IncludeFindings != 0 {
+			files, writeErr := writeFindingSidecars(ctx, s.caseRef, partial, entity, emittedFindings)
+			if writeErr != nil {
+				return Materialization{}, writeErr
+			}
+			for _, file := range files {
+				if err = addProjectionSupportFile(&manifest, file, &emittedFiles, &total, p.Spec); err != nil {
+					return Materialization{}, err
+				}
+			}
 		}
 		if p.Spec.Include&IncludeBytes == 0 || (p.Spec.Closure == ClosureSources && strings.HasPrefix(reason, "source-metadata:")) {
 			continue
 		}
-		if len(manifest.Entries) >= 100000 {
+		if emittedFiles >= p.Spec.MaxFiles {
 			return Materialization{}, fmt.Errorf("%w: projection file limit exceeded", ErrInvalid)
 		}
-		total += obj.Size
-		if total > 1<<40 {
+		if obj.Size < 0 || obj.Size > p.Spec.MaxBytes-total {
 			return Materialization{}, fmt.Errorf("%w: projection size limit exceeded", ErrInvalid)
 		}
+		total += obj.Size
 		evidenceID := ""
 		if p.Spec.Layout == LayoutByEvidencePath {
 			evidenceID, err = s.caseRef.evidenceForEntity(ctx, entity.ID)
@@ -348,6 +468,9 @@ func (s *Session) Materialize(ctx context.Context, id ProjectionID, target Direc
 			}
 		}
 		logical := projectionPath(p.Spec.Layout, entity, obj, evidenceID)
+		if len(logical) > 4096 {
+			return Materialization{}, fmt.Errorf("%w: projected path is too long", ErrInvalid)
+		}
 		if used[strings.ToLower(logical)] {
 			logical = addIDCollision(logical, entity.ID)
 		}
@@ -366,6 +489,7 @@ func (s *Session) Materialize(ctx context.Context, id ProjectionID, target Direc
 			return Materialization{}, err
 		}
 		manifest.Entries = append(manifest.Entries, ManifestEntry{Entity: entity, Blob: obj.Blob, Size: obj.Size, Path: logical, SHA256: strings.TrimPrefix(string(obj.Blob), "sha256:"), Reason: reason})
+		emittedFiles++
 	}
 	if err = rows.Err(); err != nil {
 		return Materialization{}, err
@@ -614,20 +738,13 @@ func writeEntitySidecar(ctx context.Context, c *Case, root string, e EntityRef) 
 	if err := os.MkdirAll(dir, 0700); err != nil {
 		return ManifestFile{}, err
 	}
-	var created int64
-	var name, media, activity string
-	if err := c.db.QueryRowContext(ctx, "SELECT created_revision,display_name,media_type,generating_activity_id FROM entities WHERE id=?", e.ID).Scan(&created, &name, &media, &activity); err != nil {
+	record, err := c.entityExportRecord(ctx, e)
+	if err != nil {
 		return ManifestFile{}, err
 	}
 	rel := filepath.ToSlash(filepath.Join("metadata", sanitizeComponent(e.ID)+".json"))
 	path := filepath.Join(root, filepath.FromSlash(rel))
-	if err := writeJSONAtomic(path, struct {
-		Entity             EntityRef `json:"entity"`
-		DisplayName        string    `json:"display_name"`
-		MediaType          string    `json:"media_type,omitempty"`
-		GeneratingActivity string    `json:"generating_activity"`
-		CreatedRevision    int64     `json:"created_revision"`
-	}{e, name, media, activity, created}); err != nil {
+	if err := writeJSONAtomic(path, record); err != nil {
 		return ManifestFile{}, err
 	}
 	digest, size, err := digestFile(ctx, path)
@@ -635,6 +752,79 @@ func writeEntitySidecar(ctx context.Context, c *Case, root string, e EntityRef) 
 		return ManifestFile{}, err
 	}
 	return ManifestFile{Path: rel, SHA256: digest, Size: size, Role: "metadata"}, nil
+}
+
+func writeProvenanceSidecar(ctx context.Context, c *Case, root string, entity EntityRef) (ManifestFile, error) {
+	graph, err := c.Trace(ctx, entity)
+	if err != nil {
+		return ManifestFile{}, err
+	}
+	rel := filepath.ToSlash(filepath.Join("provenance", sanitizeComponent(entity.ID)+".json"))
+	path := filepath.Join(root, filepath.FromSlash(rel))
+	if err = os.MkdirAll(filepath.Dir(path), 0700); err != nil {
+		return ManifestFile{}, err
+	}
+	if err = writeJSONAtomic(path, graph); err != nil {
+		return ManifestFile{}, err
+	}
+	digest, size, err := digestFile(ctx, path)
+	return ManifestFile{Path: rel, SHA256: digest, Size: size, Role: "provenance"}, err
+}
+
+func writeFindingSidecars(ctx context.Context, c *Case, root string, entity EntityRef, emitted map[FindingRevisionID]bool) ([]ManifestFile, error) {
+	rows, err := c.db.QueryContext(ctx, `SELECT DISTINCT fr.id FROM finding_revisions fr LEFT JOIN finding_members fm ON fm.revision_id=fr.id WHERE fr.id=? OR fm.entity_id=? ORDER BY fr.id`, entity.ID, entity.ID)
+	if err != nil {
+		return nil, mapSQLError(err)
+	}
+	var ids []FindingRevisionID
+	for rows.Next() {
+		var id FindingRevisionID
+		if err = rows.Scan(&id); err != nil {
+			rows.Close()
+			return nil, err
+		}
+		if !emitted[id] {
+			ids = append(ids, id)
+		}
+	}
+	if err = rows.Close(); err != nil {
+		return nil, err
+	}
+	var files []ManifestFile
+	for _, id := range ids {
+		finding, loadErr := c.FindingRevision(ctx, id)
+		if loadErr != nil {
+			return nil, loadErr
+		}
+		rel := filepath.ToSlash(filepath.Join("findings", sanitizeComponent(string(id))+".json"))
+		path := filepath.Join(root, filepath.FromSlash(rel))
+		if err = os.MkdirAll(filepath.Dir(path), 0700); err != nil {
+			return nil, err
+		}
+		if err = writeJSONAtomic(path, finding); err != nil {
+			return nil, err
+		}
+		digest, size, digestErr := digestFile(ctx, path)
+		if digestErr != nil {
+			return nil, digestErr
+		}
+		files = append(files, ManifestFile{Path: rel, SHA256: digest, Size: size, Role: "finding"})
+		emitted[id] = true
+	}
+	return files, nil
+}
+
+func addProjectionSupportFile(manifest *ProjectionManifest, file ManifestFile, count *int, total *int64, spec ProjectionSpec) error {
+	if *count >= spec.MaxFiles {
+		return fmt.Errorf("%w: projection file limit exceeded", ErrInvalid)
+	}
+	if file.Size < 0 || file.Size > spec.MaxBytes-*total {
+		return fmt.Errorf("%w: projection size limit exceeded", ErrInvalid)
+	}
+	manifest.Files = append(manifest.Files, file)
+	*count++
+	*total += file.Size
+	return nil
 }
 
 func (c *Case) Materialization(ctx context.Context, id MaterializationID) (Materialization, error) {

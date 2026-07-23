@@ -23,6 +23,9 @@ type sourceTreeManifest struct {
 
 type sourceTreeEntry struct {
 	Path       string        `json:"path"`
+	RawPath    []byte        `json:"raw_path,omitempty"`
+	Encoding   string        `json:"encoding,omitempty"`
+	Separator  string        `json:"separator,omitempty"`
 	Kind       TreeEntryKind `json:"kind"`
 	Mode       uint32        `json:"mode"`
 	Size       int64         `json:"size,omitempty"`
@@ -76,8 +79,20 @@ func (c *Case) ImportSourceTree(ctx context.Context, root string, spec SourceTre
 		label = "source-tree"
 	}
 	spec.Label = label
+	if spec.MaxEntries <= 0 {
+		spec.MaxEntries = 100_000
+	}
+	if spec.MaxFiles <= 0 {
+		spec.MaxFiles = 100_000
+	}
+	if spec.MaxBytes <= 0 {
+		spec.MaxBytes = 100 << 30
+	}
+	if spec.MaxEntries > 1_000_000 || spec.MaxFiles > 1_000_000 || spec.MaxBytes > 1<<50 {
+		return SourceTree{}, fmt.Errorf("%w: source-tree resource limit is too large", ErrInvalid)
+	}
 
-	entries, err := c.scanSourceTree(ctx, absRoot, spec.IncludeGitDir)
+	entries, err := c.scanSourceTree(ctx, absRoot, spec)
 	if err != nil {
 		return SourceTree{}, err
 	}
@@ -90,7 +105,8 @@ func (c *Case) ImportSourceTree(ctx context.Context, root string, spec SourceTre
 	for i := range entries {
 		e := entries[i].entry
 		manifest.Entries[i] = sourceTreeEntry{
-			Path: e.Path, Kind: e.Kind, Mode: e.Mode, Size: e.Size,
+			Path: e.Path, RawPath: e.RawPath, Encoding: e.Encoding, Separator: e.Separator,
+			Kind: e.Kind, Mode: e.Mode, Size: e.Size,
 			SHA256: e.SHA256, LinkTarget: e.LinkTarget,
 		}
 	}
@@ -119,8 +135,11 @@ func (c *Case) ImportSourceTree(ctx context.Context, root string, spec SourceTre
 		Label         string          `json:"label"`
 		Acquisition   AcquisitionSpec `json:"acquisition"`
 		IncludeGitDir bool            `json:"include_git_dir"`
+		MaxEntries    int             `json:"max_entries"`
+		MaxFiles      int             `json:"max_files"`
+		MaxBytes      int64           `json:"max_bytes"`
 		TreeDigest    string          `json:"tree_digest"`
-	}{label, spec.Acquisition, spec.IncludeGitDir, treeDigest})
+	}{label, spec.Acquisition, spec.IncludeGitDir, spec.MaxEntries, spec.MaxFiles, spec.MaxBytes, treeDigest})
 	if err != nil {
 		return SourceTree{}, err
 	}
@@ -217,7 +236,7 @@ func (c *Case) ImportSourceTree(ctx context.Context, root string, spec SourceTre
 			}
 			if found {
 				result = old
-				return nil
+				return errIdempotentReplay
 			}
 		}
 		now := time.Now().UTC().Format(time.RFC3339Nano)
@@ -248,8 +267,11 @@ func (c *Case) ImportSourceTree(ctx context.Context, root string, spec SourceTre
 			return e
 		}
 		policyJSON, _ := canonicalJSON(struct {
-			IncludeGitDir bool `json:"include_git_dir"`
-		}{spec.IncludeGitDir})
+			IncludeGitDir bool  `json:"include_git_dir"`
+			MaxEntries    int   `json:"max_entries"`
+			MaxFiles      int   `json:"max_files"`
+			MaxBytes      int64 `json:"max_bytes"`
+		}{spec.IncludeGitDir, spec.MaxEntries, spec.MaxFiles, spec.MaxBytes})
 		if _, e := tx.ExecContext(ctx, `INSERT INTO source_trees(id,evidence_id,label,tree_digest,manifest_object_id,file_count,total_bytes,entry_count,policy_json) VALUES(?,?,?,?,?,?,?,?,?)`, treeID, evidenceID, label, result.TreeDigest, manifestObjectID, fileCount, totalBytes, len(entries), string(policyJSON)); e != nil {
 			return e
 		}
@@ -278,7 +300,7 @@ func (c *Case) ImportSourceTree(ctx context.Context, root string, spec SourceTre
 				if _, e := tx.ExecContext(ctx, "INSERT INTO activity_outputs(activity_id,entity_id,role) VALUES(?,?,'tree-file')", activityID, item.object.ID); e != nil {
 					return e
 				}
-				_, locatorType, locatorJSON, e := encodeLocator(PathLocator{Display: item.entry.Path, Separator: "/"})
+				_, locatorType, locatorJSON, e := encodeLocator(PathLocator{Raw: item.entry.RawPath, Display: item.entry.Path, Encoding: item.entry.Encoding, Separator: item.entry.Separator})
 				if e != nil {
 					return e
 				}
@@ -286,7 +308,7 @@ func (c *Case) ImportSourceTree(ctx context.Context, root string, spec SourceTre
 					return e
 				}
 			}
-			if _, e := tx.ExecContext(ctx, `INSERT INTO tree_entries(tree_id,ordinal,path,entry_kind,file_mode,size,blob_digest,object_id,link_target) VALUES(?,?,?,?,?,?,?,?,?)`, treeID, i, item.entry.Path, item.entry.Kind, item.entry.Mode, item.entry.Size, blob, object, item.entry.LinkTarget); e != nil {
+			if _, e := tx.ExecContext(ctx, `INSERT INTO tree_entries(tree_id,ordinal,path,raw_path,path_encoding,path_separator,entry_kind,file_mode,size,blob_digest,object_id,link_target) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)`, treeID, i, item.entry.Path, item.entry.RawPath, item.entry.Encoding, item.entry.Separator, item.entry.Kind, item.entry.Mode, item.entry.Size, blob, object, item.entry.LinkTarget); e != nil {
 				return e
 			}
 		}
@@ -302,8 +324,10 @@ func (c *Case) ImportSourceTree(ctx context.Context, root string, spec SourceTre
 	return result, err
 }
 
-func (c *Case) scanSourceTree(ctx context.Context, root string, includeGit bool) ([]importedTreeEntry, error) {
+func (c *Case) scanSourceTree(ctx context.Context, root string, spec SourceTreeSpec) ([]importedTreeEntry, error) {
 	var entries []importedTreeEntry
+	files := 0
+	var totalBytes int64
 	err := filepath.WalkDir(root, func(path string, d fs.DirEntry, walkErr error) error {
 		if walkErr != nil {
 			return walkErr
@@ -322,14 +346,17 @@ func (c *Case) scanSourceTree(ctx context.Context, root string, includeGit bool)
 		if rel == "" || rel == "." || strings.HasPrefix(rel, "../") || filepath.IsAbs(rel) {
 			return fmt.Errorf("%w: unsafe source-tree path", ErrInvalid)
 		}
-		if d.IsDir() && !includeGit && d.Name() == ".git" {
+		if d.IsDir() && !spec.IncludeGitDir && d.Name() == ".git" {
 			return filepath.SkipDir
+		}
+		if len(entries) >= spec.MaxEntries {
+			return fmt.Errorf("%w: source-tree entry limit exceeded", ErrInvalid)
 		}
 		info, err := os.Lstat(path)
 		if err != nil {
 			return err
 		}
-		item := importedTreeEntry{entry: TreeEntry{Path: rel, Mode: uint32(info.Mode().Perm())}}
+		item := importedTreeEntry{entry: TreeEntry{Path: rel, RawPath: []byte(rel), Encoding: "filesystem", Separator: string(os.PathSeparator), Mode: uint32(info.Mode().Perm())}}
 		switch {
 		case info.Mode()&os.ModeSymlink != 0:
 			item.entry.Kind = TreeEntrySymlink
@@ -340,6 +367,13 @@ func (c *Case) scanSourceTree(ctx context.Context, root string, includeGit bool)
 		case info.IsDir():
 			item.entry.Kind = TreeEntryDirectory
 		case info.Mode().IsRegular():
+			files++
+			if files > spec.MaxFiles {
+				return fmt.Errorf("%w: source-tree file limit exceeded", ErrInvalid)
+			}
+			if info.Size() < 0 || info.Size() > spec.MaxBytes-totalBytes {
+				return fmt.Errorf("%w: source-tree byte limit exceeded", ErrInvalid)
+			}
 			item.entry.Kind = TreeEntryFile
 			f, openErr := os.Open(path)
 			if openErr != nil {
@@ -370,6 +404,7 @@ func (c *Case) scanSourceTree(ctx context.Context, root string, includeGit bool)
 			}
 			item.entry.Size = item.staged.size
 			item.entry.SHA256 = item.staged.digest
+			totalBytes += item.staged.size
 		default:
 			return fmt.Errorf("%w: unsupported filesystem entry %s", ErrUnsupported, rel)
 		}
@@ -403,7 +438,7 @@ func (c *Case) SourceTree(ctx context.Context, id TreeID) (SourceTree, error) {
 	if err != nil {
 		return SourceTree{}, mapSQLError(err)
 	}
-	rows, err := c.db.QueryContext(ctx, `SELECT te.path,te.entry_kind,te.file_mode,te.size,COALESCE(te.blob_digest,''),COALESCE(te.link_target,''),COALESCE(te.object_id,''),COALESCE(oe.display_name,''),COALESCE(oe.media_type,''),COALESCE(o.path_display,''),COALESCE(oe.generating_activity_id,''),COALESCE(oe.created_revision,0) FROM tree_entries te LEFT JOIN objects o ON o.id=te.object_id LEFT JOIN entities oe ON oe.id=o.id WHERE te.tree_id=? ORDER BY te.ordinal`, id)
+	rows, err := c.db.QueryContext(ctx, `SELECT te.path,te.raw_path,te.path_encoding,te.path_separator,te.entry_kind,te.file_mode,te.size,COALESCE(te.blob_digest,''),COALESCE(te.link_target,''),COALESCE(te.object_id,''),COALESCE(oe.display_name,''),COALESCE(oe.media_type,''),COALESCE(o.path_display,''),COALESCE(oe.generating_activity_id,''),COALESCE(oe.created_revision,0) FROM tree_entries te LEFT JOIN objects o ON o.id=te.object_id LEFT JOIN entities oe ON oe.id=o.id WHERE te.tree_id=? ORDER BY te.ordinal`, id)
 	if err != nil {
 		return SourceTree{}, mapSQLError(err)
 	}
@@ -415,7 +450,7 @@ func (c *Case) SourceTree(ctx context.Context, id TreeID) (SourceTree, error) {
 		var displayName, mediaType, objectPath string
 		var generatingActivity ActivityID
 		var createdRevision int64
-		if err = rows.Scan(&entry.Path, &entry.Kind, &entry.Mode, &entry.Size, &blob, &entry.LinkTarget, &objectID, &displayName, &mediaType, &objectPath, &generatingActivity, &createdRevision); err != nil {
+		if err = rows.Scan(&entry.Path, &entry.RawPath, &entry.Encoding, &entry.Separator, &entry.Kind, &entry.Mode, &entry.Size, &blob, &entry.LinkTarget, &objectID, &displayName, &mediaType, &objectPath, &generatingActivity, &createdRevision); err != nil {
 			return SourceTree{}, err
 		}
 		if entry.Kind == TreeEntryFile {

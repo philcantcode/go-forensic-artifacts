@@ -66,4 +66,14 @@ func TestRepositorySafetyAndForwardSchemaRejection(t *testing.T) {
 	if _, err = repo.OpenCase(ctx, ByID(id)); !errors.Is(err, ErrUnsupportedStorage) {
 		t.Fatalf("forward schema = %v", err)
 	}
+	repositoryRoot := repo.Root()
+	if _, err = repo.db.ExecContext(ctx, "UPDATE repository_info SET format_version=? WHERE singleton=1", RepositoryFormat+1); err != nil {
+		t.Fatal(err)
+	}
+	if err = repo.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err = Open(ctx, Config{Root: repositoryRoot}); !errors.Is(err, ErrUnsupportedStorage) {
+		t.Fatalf("forward repository format = %v", err)
+	}
 }
