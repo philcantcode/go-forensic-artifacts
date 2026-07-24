@@ -7,6 +7,8 @@ All notable changes to this project are documented here. The project follows
 
 - Moved the public library package from the module root into `forensic/`.
   Import path is now `github.com/philcantcode/go-forensic-artifacts/forensic`.
+- Documented the module layout (`forensic/`, `cmd/`, `examples/`, `docs/`) in
+  README, design §15.5 / §22, ADR 0006, RELEASING, and implementation-status.
 - Added `cmd/forensicctl`, a thin operator CLI for case create/list/info,
   file and source-tree import, integrity verify, simple queries, text search,
   and recovery inspection.

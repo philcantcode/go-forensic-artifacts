@@ -174,13 +174,18 @@ The short decision records are in [`docs/adr`](docs/adr):
 ## Repository layout
 
 ```text
-forensic/     public library package
-cmd/          operator CLI (forensicctl)
-examples/     runnable library samples
-docs/         design notes and ADRs
+forensic/                 public library package
+cmd/forensicctl/          operator CLI
+examples/import-source-tree/  runnable library sample
+docs/                     design notes and ADRs
+.github/                  CI and release workflows
 ```
 
-Import path: `github.com/philcantcode/go-forensic-artifacts/forensic`.
+Import path:
+
+```go
+import forensic "github.com/philcantcode/go-forensic-artifacts/forensic"
+```
 
 ## CLI (`cmd/forensicctl`)
 
@@ -206,8 +211,8 @@ Global flags: `-repo` (or `FORENSIC_REPO`), `-agent`, `-json`. Commands include
 
 ## Library example (`examples/`)
 
-Runnable programs that import the library (not `package main` under the module
-root) live in `examples/`. Start with source-tree import:
+Runnable programs that import the library live under `examples/` (separate from
+the `forensic` package). Start with source-tree import:
 
 ```text
 go run ./examples/import-source-tree
@@ -224,19 +229,23 @@ fixes used by the repository, checkpoint, and export paths.
 
 ```text
 go test ./...
+go test ./forensic/ -count=1
 go test -race ./...
 go vet ./...
-go build ./cmd/forensicctl
+go build ./cmd/... ./examples/...
 go run ./examples/import-source-tree
 ```
 
-The tests exercise 100 concurrent mixed workers under the race detector,
-multi-process import/query/tag/freeze, forced process termination at persistence
-boundaries, export fault injection, deterministic projections, portable restore,
-path/manifest fuzz seeds, and deliberate blob/catalog/package corruption.
+Library tests live under `forensic/`. The suite exercises 100 concurrent mixed
+workers under the race detector, multi-process import/query/tag/freeze, forced
+process termination at persistence boundaries, export fault injection,
+deterministic projections, portable restore, path/manifest fuzz seeds, and
+deliberate blob/catalog/package corruption.
 
 The acceptance evidence is mapped in
 [docs/implementation-status.md](docs/implementation-status.md).
+Architecture notes and package layout are in [docs/design.md](docs/design.md)
+(section 15.5) and [docs/adr](docs/adr).
 
 ## Releases and security
 

@@ -4,7 +4,8 @@ Status: implemented and verified, July 2026.
 
 This matrix maps the ten acceptance criteria in
 [section 20.2 of the design](design.md#202-version-1-acceptance-criteria) to
-executable evidence.
+executable evidence. Library tests live under `forensic/`
+(`go test ./forensic/ ...` or `go test ./...`).
 
 | Criterion | Evidence |
 | --- | --- |

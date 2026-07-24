@@ -7,7 +7,11 @@ The repository implements the recommended vertical slice in section 23 and the
 version 1 acceptance criteria in section 20.2. Later ecosystem adapters in phase
 5 remain optional extension modules rather than core storage requirements.
 
-This document defines a reusable Go library for managing forensic evidence and vulnerability-research outputs. The working package name in examples is `forensic`; the final Go module path and product name remain to be chosen.
+This document defines a reusable Go library for managing forensic evidence and
+vulnerability-research outputs. The public package is `forensic` at
+`github.com/philcantcode/go-forensic-artifacts/forensic`. The module root holds
+`forensic/` (library), `cmd/` (operator CLI), `examples/` (runnable samples), and
+`docs/` (this design and ADRs).
 
 ## 1. Executive decision
 
@@ -702,7 +706,11 @@ In-process parsers have the authority of the host process and are appropriate on
 
 ## 15. Proposed Go API
 
-The simple path should remain small:
+The simple path should remain small. Import the library as:
+
+```go
+import forensic "github.com/philcantcode/go-forensic-artifacts/forensic"
+```
 
 ```go
 repo, err := forensic.Open(ctx, forensic.Config{
@@ -827,23 +835,38 @@ Markdown output has deterministic ordering, stable ID anchors, YAML/JSON front m
 - `io.Reader`, `io.ReaderAt`, and `fs.FS` integration is preferred over path-only APIs.
 - Storage and SQLite types remain internal so a future service backend does not break callers.
 
-### 15.5 Proposed package boundaries
+### 15.5 Package layout
 
-Keep the initial public surface compact and move mechanisms behind `internal` packages:
+The version 1 implementation keeps one public library package and colocates
+operator tooling beside it:
 
 ```text
-forensic                 repository, case, session, provenance, core records
-artifact                 typed values, schemas, locators, temporal values
-query                    expression AST, results, selections, byte search
-parser                   parser/factory/sink contracts and scheduler helpers
-projection               projection specs, targets, manifests
-export/bagit             BagIt adapter
-schema/vuln              optional vulnerability-finding vocabulary
+github.com/philcantcode/go-forensic-artifacts
+├── forensic/              public library (repository, case, session, CAS,
+│                          catalog, query, parser, projection, export, verify)
+├── cmd/forensicctl/       thin operator CLI over the library
+├── examples/              runnable samples (not part of the public API surface)
+└── docs/                  design document and architecture decision records
+```
+
+Import path:
+
+```go
+import forensic "github.com/philcantcode/go-forensic-artifacts/forensic"
+```
+
+Later splits remain optional and should not break the public import path without
+a major release. Candidates if the package grows:
+
+```text
+forensic                 public API surface (stable import)
 internal/catalog/sqlite  schema, migrations, transactions, indexes
 internal/cas             staging, hashing, publication, readers, verification
 ```
 
-Package boundaries are allowed to change during the first vertical slice. Public interfaces should be introduced only when two real implementations or consumers demonstrate the boundary; storage-engine interfaces stay internal.
+Additional public packages (`query`, `parser`, `projection`, `export/bagit`,
+`schema/vuln`) should only be introduced when two real implementations or
+consumers demonstrate the boundary. Storage-engine types stay non-exported.
 
 ## 16. Deliverables and interchange
 
@@ -1053,9 +1076,9 @@ Exit: produce a repeatable vulnerability deliverable whose included data and tra
 
 The feasibility work resolved the previously open choices:
 
-1. The public package is `forensic` in module `github.com/forensic-artifacts/go-forensic-artifacts`.
+1. The module is `github.com/philcantcode/go-forensic-artifacts`. The public package is `forensic` at `github.com/philcantcode/go-forensic-artifacts/forensic` (source under `forensic/`). Operator CLI and samples live in `cmd/forensicctl` and `examples/`.
 2. SQLite uses the CGO-free `modernc.org/sqlite` driver. Startup and integration tests exercise WAL, FTS5, busy handling, and online backup.
-3. The minimum language/toolchain version is Go 1.23. The implementation uses portable Go and filesystem APIs for Windows, Linux, and macOS.
+3. The minimum language/toolchain version is Go 1.25.8. The implementation uses portable Go and filesystem APIs for Windows, Linux, and macOS.
 4. Audit events and manifests use constrained canonical JSON.
 5. SHA-256 is the version 1 CAS and fixity algorithm. Supplied SHA-256 acquisition hashes are checked during import.
 6. Version 1 projections copy only. Reflinks can be added later without changing manifests or provenance.
