@@ -5,8 +5,11 @@ All notable changes to this project are documented here. The project follows
 
 ## [Unreleased]
 
+## [0.2.0] - 2026-07-24
+
 - Moved the public library package from the module root into `forensic/`.
   Import path is now `github.com/philcantcode/go-forensic-artifacts/forensic`.
+  This is a breaking change for importers of the 0.1.0 path.
 - Documented the module layout (`forensic/`, `cmd/`, `examples/`, `docs/`) in
   README, design §15.5 / §22, ADR 0006, RELEASING, and implementation-status.
 - Added `cmd/forensicctl`, a thin operator CLI for case create/list/info,
@@ -51,4 +54,5 @@ Initial public release.
 - Added concurrent, multi-process, crash-boundary, corruption, fuzz, and race tests.
 - Added architecture decision records, CI, release automation, and security policy.
 
+[0.2.0]: https://github.com/philcantcode/go-forensic-artifacts/releases/tag/v0.2.0
 [0.1.0]: https://github.com/philcantcode/go-forensic-artifacts/releases/tag/v0.1.0
