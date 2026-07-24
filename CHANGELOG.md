@@ -3,6 +3,16 @@
 All notable changes to this project are documented here. The project follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+- Moved the public library package from the module root into `forensic/`.
+  Import path is now `github.com/philcantcode/go-forensic-artifacts/forensic`.
+- Added `cmd/forensicctl`, a thin operator CLI for case create/list/info,
+  file and source-tree import, integrity verify, simple queries, text search,
+  and recovery inspection.
+- Added `examples/import-source-tree`, a runnable library example that imports
+  a directory, queries `.go` members, and verifies the case.
+
 ## [0.1.0] - 2026-07-23
 
 Initial public release.

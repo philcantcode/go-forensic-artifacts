@@ -1,7 +1,7 @@
 # Go forensic artifact store
 
 [![CI](https://github.com/philcantcode/go-forensic-artifacts/actions/workflows/ci.yml/badge.svg)](https://github.com/philcantcode/go-forensic-artifacts/actions/workflows/ci.yml)
-[![Go Reference](https://pkg.go.dev/badge/github.com/philcantcode/go-forensic-artifacts.svg)](https://pkg.go.dev/github.com/philcantcode/go-forensic-artifacts)
+[![Go Reference](https://pkg.go.dev/badge/github.com/philcantcode/go-forensic-artifacts/forensic.svg)](https://pkg.go.dev/github.com/philcantcode/go-forensic-artifacts/forensic)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
 `forensic` is a local-first Go library for immutable forensic evidence and
@@ -71,6 +71,8 @@ symlink targets are retained in the tree manifest.
 ## Quick start
 
 ```go
+import forensic "github.com/philcantcode/go-forensic-artifacts/forensic"
+
 repo, err := forensic.Open(ctx, forensic.Config{
     Root: "/srv/forensics",
     DefaultAgent: forensic.AgentSpec{
@@ -169,6 +171,52 @@ The short decision records are in [`docs/adr`](docs/adr):
 5. freeze-before-projection; and
 6. Go/SQLite implementation baseline.
 
+## Repository layout
+
+```text
+forensic/     public library package
+cmd/          operator CLI (forensicctl)
+examples/     runnable library samples
+docs/         design notes and ADRs
+```
+
+Import path: `github.com/philcantcode/go-forensic-artifacts/forensic`.
+
+## CLI (`cmd/forensicctl`)
+
+`forensicctl` is a thin operator CLI over the library. Durable state stays in
+the case repository; the tool covers common workflows.
+
+```text
+go run ./cmd/forensicctl -repo /srv/forensics case create router-firmware
+go run ./cmd/forensicctl -repo /srv/forensics import tree ./source --case router-firmware
+go run ./cmd/forensicctl -repo /srv/forensics query --case router-firmware --kind object --ext .go
+go run ./cmd/forensicctl -repo /srv/forensics verify --case router-firmware --mode full
+```
+
+Install a binary with:
+
+```text
+go install github.com/philcantcode/go-forensic-artifacts/cmd/forensicctl@latest
+```
+
+Global flags: `-repo` (or `FORENSIC_REPO`), `-agent`, `-json`. Commands include
+`case create|list|info`, `import file|tree`, `verify`, `query`, `search`, and
+`recover inspect`.
+
+## Library example (`examples/`)
+
+Runnable programs that import the library (not `package main` under the module
+root) live in `examples/`. Start with source-tree import:
+
+```text
+go run ./examples/import-source-tree
+go run ./examples/import-source-tree -repo ./tmp-repo -source ./my-project -keep
+```
+
+The example creates or reopens a case, imports a directory as a source tree,
+queries `.go` members, and runs a quick integrity verify.
+
 ## Development
 
 Go 1.25.8 or newer is required. This floor includes standard-library security
@@ -178,6 +226,8 @@ fixes used by the repository, checkpoint, and export paths.
 go test ./...
 go test -race ./...
 go vet ./...
+go build ./cmd/forensicctl
+go run ./examples/import-source-tree
 ```
 
 The tests exercise 100 concurrent mixed workers under the race detector,

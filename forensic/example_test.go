@@ -6,7 +6,7 @@ import (
 	"os"
 	"path/filepath"
 
-	forensic "github.com/philcantcode/go-forensic-artifacts"
+	forensic "github.com/philcantcode/go-forensic-artifacts/forensic"
 )
 
 func ExampleCase_ImportSourceTree() {
