@@ -43,6 +43,11 @@ func makeTreeWritable(root string) {
 		if err != nil {
 			return nil
 		}
+		// os.Chmod follows symlinks; never chmod through a link or a directory
+		// target can lose its execute bit (breaking later RemoveAll traversal).
+		if d.Type()&os.ModeSymlink != 0 {
+			return nil
+		}
 		if d.IsDir() {
 			_ = os.Chmod(path, 0o700)
 			return nil
