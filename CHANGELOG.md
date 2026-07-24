@@ -17,6 +17,8 @@ All notable changes to this project are documented here. The project follows
   and recovery inspection.
 - Added `examples/import-source-tree`, a runnable library example that imports
   a directory, queries `.go` members, and verifies the case.
+- Fixed Unix test cleanup after read-only projections (directories chmod'd to
+  `0500`) so `t.TempDir` can remove the tree on Linux and macOS CI.
 
 ## [0.1.0] - 2026-07-23
 

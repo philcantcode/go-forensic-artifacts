@@ -22,6 +22,9 @@ func openTestRepo(t *testing.T) (context.Context, string, *Repository, *Case) {
 	t.Helper()
 	ctx := context.Background()
 	base := t.TempDir()
+	// Read-only projections chmod directories to 0500. Restore write bits before
+	// t.TempDir cleanup so Unix unlink succeeds (cleanup order is LIFO).
+	t.Cleanup(func() { makeTreeWritable(base) })
 	repo, err := Open(ctx, Config{Root: filepath.Join(base, "repository"), DefaultAgent: AgentSpec{Kind: AgentSoftware, Name: "test-agent"}})
 	if err != nil {
 		t.Fatalf("open repository: %v", err)
@@ -33,6 +36,20 @@ func openTestRepo(t *testing.T) (context.Context, string, *Repository, *Case) {
 	}
 	t.Cleanup(func() { _ = c.Close() })
 	return ctx, base, repo, c
+}
+
+func makeTreeWritable(root string) {
+	_ = filepath.WalkDir(root, func(path string, d os.DirEntry, err error) error {
+		if err != nil {
+			return nil
+		}
+		if d.IsDir() {
+			_ = os.Chmod(path, 0o700)
+			return nil
+		}
+		_ = os.Chmod(path, 0o600)
+		return nil
+	})
 }
 
 func TestEndToEndVerticalSlice(t *testing.T) {
