@@ -5,6 +5,8 @@ All notable changes to this project are documented here. The project follows
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-07-27
+
 - Added composable `HasAncestor` and `HasDescendant` typed query predicates for
   filtering entities by facts elsewhere in their immutable provenance graph.
 
@@ -59,5 +61,6 @@ Initial public release.
 - Added concurrent, multi-process, crash-boundary, corruption, fuzz, and race tests.
 - Added architecture decision records, CI, release automation, and security policy.
 
+[0.3.0]: https://github.com/philcantcode/go-forensic-artifacts/releases/tag/v0.3.0
 [0.2.0]: https://github.com/philcantcode/go-forensic-artifacts/releases/tag/v0.2.0
 [0.1.0]: https://github.com/philcantcode/go-forensic-artifacts/releases/tag/v0.1.0
