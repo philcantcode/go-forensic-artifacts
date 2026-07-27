@@ -26,8 +26,9 @@ vertical slice:
 - wrapped external experiments with protected projection inputs, allowlisted
   environments, bounded logs, declared outputs, and captured exit status;
 - typed structured queries across schema, media, size, provenance, evidence,
-  findings, assertions, revisions, and descendants; exact frozen selections;
-  and provenance tracing;
+  findings, assertions, revisions, and descendants, including composable
+  ancestor/descendant predicates; exact frozen selections; and provenance
+  tracing;
 - deterministic copy-only directory projections with safe paths, explicit
   policy exclusions, typed metadata, provenance/finding sidecars, and
   manifests;

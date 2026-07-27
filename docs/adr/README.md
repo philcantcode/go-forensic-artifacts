@@ -7,6 +7,7 @@
 - [ADR 0005: Freeze before projection](0005-freeze-before-projection.md)
 - [ADR 0006: Go and SQLite implementation baseline](0006-implementation-baseline.md)
   (module path, `forensic/` package layout, Go 1.25.8, CGO-free SQLite)
+- [ADR 0007: Compose queries across provenance relationships](0007-composable-provenance-relationship-queries.md)
 
 The records are intentionally short. Detailed rationale and threat analysis are
 kept in [the architecture document](../design.md).

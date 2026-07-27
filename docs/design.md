@@ -582,6 +582,14 @@ A typed expression AST supports:
 
 The compiler uses parameters and an allowlisted AST. No public API accepts SQL fragments.
 
+Relationship predicates are composable. `HasAncestor(q)` and
+`HasDescendant(q)` evaluate `q` against strict transitive provenance relatives
+in the same read snapshot and case revision as the candidate query. This lets a
+caller select one derived entity using typed facts emitted elsewhere beneath a
+shared source—for example, manifest objects whose ancestor APK has a descendant
+locale artifact normalized to language `ru`. Hosts do not perform a second
+trace-and-join pass.
+
 ### 12.2 Full text
 
 SQLite FTS5 indexes selected textual artifact values, object display/original paths, finding revisions, comments, and optionally parser-extracted text. Each hit retains the exact entity/property/source locator. FTS is a rebuildable index, never the authoritative artifact store.

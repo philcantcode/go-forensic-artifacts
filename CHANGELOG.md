@@ -5,6 +5,9 @@ All notable changes to this project are documented here. The project follows
 
 ## [Unreleased]
 
+- Added composable `HasAncestor` and `HasDescendant` typed query predicates for
+  filtering entities by facts elsewhere in their immutable provenance graph.
+
 ## [0.2.0] - 2026-07-24
 
 - Moved the public library package from the module root into `forensic/`.

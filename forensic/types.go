@@ -596,6 +596,8 @@ const (
 	QueryEvidence      QueryOp = "evidence"
 	QueryFinding       QueryOp = "finding"
 	QueryDescendant    QueryOp = "descendant"
+	QueryHasAncestor   QueryOp = "has_ancestor"
+	QueryHasDescendant QueryOp = "has_descendant"
 	QueryRevision      QueryOp = "revision"
 	QueryAssertionType QueryOp = "assertion_type"
 )
@@ -644,6 +646,15 @@ func ProducedByTool(name, version string) Query {
 func InEvidence(id EvidenceID) Query     { return Query{Op: QueryEvidence, Value: string(id)} }
 func InFinding(id FindingID) Query       { return Query{Op: QueryFinding, Value: string(id)} }
 func DescendsFrom(entityID string) Query { return Query{Op: QueryDescendant, Value: entityID} }
+
+// HasAncestor matches an entity when at least one strict provenance ancestor
+// matches q. The candidate entity itself is never considered its ancestor.
+func HasAncestor(q Query) Query { return Query{Op: QueryHasAncestor, Children: []Query{q}} }
+
+// HasDescendant matches an entity when at least one strict provenance
+// descendant matches q. The candidate entity itself is never considered its
+// descendant.
+func HasDescendant(q Query) Query { return Query{Op: QueryHasDescendant, Children: []Query{q}} }
 func CreatedAtRevision(minimum, maximum int64) Query {
 	return Query{Op: QueryRevision, Min: minimum, Max: maximum}
 }

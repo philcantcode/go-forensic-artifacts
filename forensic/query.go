@@ -61,9 +61,9 @@ func validateQuery(q Query, depth *int, nodes *int) error {
 				return fmt.Errorf("%w: query value required", ErrInvalid)
 			}
 		}
-	case QueryNot:
+	case QueryNot, QueryHasAncestor, QueryHasDescendant:
 		if len(q.Children) != 1 {
-			return fmt.Errorf("%w: not requires one child", ErrInvalid)
+			return fmt.Errorf("%w: unary query requires one child", ErrInvalid)
 		}
 	case QueryAnd, QueryOr:
 		if len(q.Children) == 0 {
@@ -103,9 +103,10 @@ func (c *Case) Query(ctx context.Context, q Query) (QueryResult, error) {
 		return QueryResult{}, err
 	}
 	membershipCache := map[string]map[string]bool{}
+	viewCache := indexEntityViews(views)
 	var out []EntityRef
 	for _, v := range views {
-		ok, e := matchQuery(ctx, tx, q, v, membershipCache)
+		ok, e := matchQuery(ctx, tx, rev, q, v, membershipCache, viewCache)
 		if e != nil {
 			return QueryResult{}, e
 		}
@@ -163,6 +164,7 @@ func (c *Case) QueryPage(ctx context.Context, spec QueryPageSpec) (QueryPageResu
 	result := QueryPageResult{Revision: spec.Revision}
 	after := spec.After
 	membershipCache := map[string]map[string]bool{}
+	viewCache := map[string]entityView{}
 	const candidateBatch = 512
 	for len(result.Entities) < spec.Limit {
 		views, loadErr := loadEntityViewsPage(ctx, tx, spec.Revision, after, candidateBatch)
@@ -172,9 +174,10 @@ func (c *Case) QueryPage(ctx context.Context, spec QueryPageSpec) (QueryPageResu
 		if len(views) == 0 {
 			break
 		}
+		addEntityViews(viewCache, views)
 		for _, view := range views {
 			after = view.ref
-			matched, matchErr := matchQuery(ctx, tx, spec.Query, view, membershipCache)
+			matched, matchErr := matchQuery(ctx, tx, spec.Revision, spec.Query, view, membershipCache, viewCache)
 			if matchErr != nil {
 				return QueryPageResult{}, matchErr
 			}
@@ -200,8 +203,10 @@ func loadEntityViews(ctx context.Context, tx *sql.Tx, rev int64) ([]entityView, 
 	return loadEntityViewsPage(ctx, tx, rev, EntityRef{}, 0)
 }
 
+const entityViewSelect = `SELECT e.id,e.kind,e.generating_activity_id,COALESCE(a.session_id,''),COALESCE(o.path_display,''),COALESCE(o.blob_digest,''),COALESCE(ar.artifact_type,''),e.schema_uri,e.media_type,COALESCE(o.size,-1),a.agent_id,COALESCE(a.tool_json,''),e.created_revision,COALESCE(asn.assertion_type,'') FROM entities e JOIN activities a ON a.id=e.generating_activity_id LEFT JOIN objects o ON o.id=e.id LEFT JOIN artifacts ar ON ar.id=e.id LEFT JOIN assertions asn ON asn.id=e.id`
+
 func loadEntityViewsPage(ctx context.Context, tx *sql.Tx, rev int64, after EntityRef, limit int) ([]entityView, error) {
-	query := `SELECT e.id,e.kind,e.generating_activity_id,COALESCE(a.session_id,''),COALESCE(o.path_display,''),COALESCE(o.blob_digest,''),COALESCE(ar.artifact_type,''),e.schema_uri,e.media_type,COALESCE(o.size,-1),a.agent_id,COALESCE(a.tool_json,''),e.created_revision,COALESCE(asn.assertion_type,'') FROM entities e JOIN activities a ON a.id=e.generating_activity_id LEFT JOIN objects o ON o.id=e.id LEFT JOIN artifacts ar ON ar.id=e.id LEFT JOIN assertions asn ON asn.id=e.id WHERE e.created_revision<=?`
+	query := entityViewSelect + ` WHERE e.created_revision<=?`
 	args := []any{rev}
 	if after.ID != "" {
 		query += " AND (e.kind>? OR (e.kind=? AND e.id>?))"
@@ -217,12 +222,45 @@ func loadEntityViewsPage(ctx context.Context, tx *sql.Tx, rev int64, after Entit
 		return nil, err
 	}
 	defer rows.Close()
+	return scanEntityViews(ctx, tx, rows)
+}
+
+func loadEntityViewsByIDs(ctx context.Context, tx *sql.Tx, rev int64, ids []string) ([]entityView, error) {
+	const batchSize = 400
+	var views []entityView
+	for start := 0; start < len(ids); start += batchSize {
+		end := min(start+batchSize, len(ids))
+		batch := ids[start:end]
+		placeholders := strings.TrimSuffix(strings.Repeat("?,", len(batch)), ",")
+		args := make([]any, 0, len(batch)+1)
+		args = append(args, rev)
+		for _, id := range batch {
+			args = append(args, id)
+		}
+		rows, err := tx.QueryContext(ctx, entityViewSelect+` WHERE e.created_revision<=? AND e.id IN (`+placeholders+`) ORDER BY e.kind,e.id`, args...)
+		if err != nil {
+			return nil, err
+		}
+		loaded, scanErr := scanEntityViews(ctx, tx, rows)
+		closeErr := rows.Close()
+		if scanErr != nil {
+			return nil, scanErr
+		}
+		if closeErr != nil {
+			return nil, closeErr
+		}
+		views = append(views, loaded...)
+	}
+	return views, nil
+}
+
+func scanEntityViews(ctx context.Context, tx *sql.Tx, rows *sql.Rows) ([]entityView, error) {
 	var views []entityView
 	index := map[string]int{}
 	for rows.Next() {
 		var v entityView
 		var toolJSON string
-		if err = rows.Scan(&v.ref.ID, &v.ref.Kind, &v.activity, &v.session, &v.path, &v.hash, &v.artifactType, &v.schema, &v.mediaType, &v.size, &v.agent, &toolJSON, &v.created, &v.assertionType); err != nil {
+		if err := rows.Scan(&v.ref.ID, &v.ref.Kind, &v.activity, &v.session, &v.path, &v.hash, &v.artifactType, &v.schema, &v.mediaType, &v.size, &v.agent, &toolJSON, &v.created, &v.assertionType); err != nil {
 			return nil, err
 		}
 		if toolJSON != "" && toolJSON != "null" {
@@ -237,7 +275,7 @@ func loadEntityViewsPage(ctx context.Context, tx *sql.Tx, rev int64, after Entit
 		index[v.ref.ID] = len(views)
 		views = append(views, v)
 	}
-	if err = rows.Err(); err != nil {
+	if err := rows.Err(); err != nil {
 		return nil, err
 	}
 	artifactIDs := make([]string, 0, len(views))
@@ -292,7 +330,19 @@ func loadEntityViewsPage(ctx context.Context, tx *sql.Tx, rev int64, after Entit
 	return views, tr.Err()
 }
 
-func matchQuery(ctx context.Context, tx *sql.Tx, q Query, v entityView, cache map[string]map[string]bool) (bool, error) {
+func indexEntityViews(views []entityView) map[string]entityView {
+	index := make(map[string]entityView, len(views))
+	addEntityViews(index, views)
+	return index
+}
+
+func addEntityViews(index map[string]entityView, views []entityView) {
+	for _, view := range views {
+		index[view.ref.ID] = view
+	}
+}
+
+func matchQuery(ctx context.Context, tx *sql.Tx, revision int64, q Query, v entityView, cache map[string]map[string]bool, viewCache map[string]entityView) (bool, error) {
 	switch q.Op {
 	case QueryAll:
 		return true, nil
@@ -468,12 +518,16 @@ func matchQuery(ctx context.Context, tx *sql.Tx, q Query, v entityView, cache ma
 			cache[cacheKey] = members
 		}
 		return members[v.ref.ID], nil
+	case QueryHasAncestor:
+		return matchRelatedQuery(ctx, tx, revision, q.Children[0], v, "ancestor", cache, viewCache)
+	case QueryHasDescendant:
+		return matchRelatedQuery(ctx, tx, revision, q.Children[0], v, "descendant", cache, viewCache)
 	case QueryNot:
-		ok, err := matchQuery(ctx, tx, q.Children[0], v, cache)
+		ok, err := matchQuery(ctx, tx, revision, q.Children[0], v, cache, viewCache)
 		return !ok, err
 	case QueryAnd:
 		for _, child := range q.Children {
-			ok, err := matchQuery(ctx, tx, child, v, cache)
+			ok, err := matchQuery(ctx, tx, revision, child, v, cache, viewCache)
 			if err != nil || !ok {
 				return ok, err
 			}
@@ -481,7 +535,7 @@ func matchQuery(ctx context.Context, tx *sql.Tx, q Query, v entityView, cache ma
 		return true, nil
 	case QueryOr:
 		for _, child := range q.Children {
-			ok, err := matchQuery(ctx, tx, child, v, cache)
+			ok, err := matchQuery(ctx, tx, revision, child, v, cache, viewCache)
 			if err != nil {
 				return false, err
 			}
@@ -492,6 +546,86 @@ func matchQuery(ctx context.Context, tx *sql.Tx, q Query, v entityView, cache ma
 		return false, nil
 	}
 	return false, ErrInvalid
+}
+
+func matchRelatedQuery(ctx context.Context, tx *sql.Tx, revision int64, predicate Query, candidate entityView, direction string, cache map[string]map[string]bool, viewCache map[string]entityView) (bool, error) {
+	members, err := relatedEntityIDs(ctx, tx, candidate.ref.ID, direction, cache)
+	if err != nil {
+		return false, err
+	}
+	missing := make([]string, 0, len(members))
+	for id := range members {
+		if _, ok := viewCache[id]; !ok {
+			missing = append(missing, id)
+		}
+	}
+	if len(missing) > 0 {
+		views, loadErr := loadEntityViewsByIDs(ctx, tx, revision, missing)
+		if loadErr != nil {
+			return false, loadErr
+		}
+		addEntityViews(viewCache, views)
+	}
+	for id := range members {
+		view, ok := viewCache[id]
+		if !ok {
+			continue
+		}
+		matched, matchErr := matchQuery(ctx, tx, revision, predicate, view, cache, viewCache)
+		if matchErr != nil {
+			return false, matchErr
+		}
+		if matched {
+			return true, nil
+		}
+	}
+	return false, nil
+}
+
+func relatedEntityIDs(ctx context.Context, tx *sql.Tx, entityID string, direction string, cache map[string]map[string]bool) (map[string]bool, error) {
+	cacheKey := "strict-" + direction + ":" + entityID
+	if members, ok := cache[cacheKey]; ok {
+		return members, nil
+	}
+	var query string
+	switch direction {
+	case "ancestor":
+		query = `WITH RECURSIVE related(id) AS (` +
+			`SELECT ai.entity_id FROM activity_outputs ao JOIN activity_inputs ai ON ai.activity_id=ao.activity_id WHERE ao.entity_id=? ` +
+			`UNION SELECT ai.entity_id FROM related r JOIN activity_outputs ao ON ao.entity_id=r.id JOIN activity_inputs ai ON ai.activity_id=ao.activity_id` +
+			`) SELECT id FROM related`
+	case "descendant":
+		query = `WITH RECURSIVE related(id) AS (` +
+			`SELECT ao.entity_id FROM activity_inputs ai JOIN activity_outputs ao ON ao.activity_id=ai.activity_id WHERE ai.entity_id=? ` +
+			`UNION SELECT ao.entity_id FROM related r JOIN activity_inputs ai ON ai.entity_id=r.id JOIN activity_outputs ao ON ao.activity_id=ai.activity_id` +
+			`) SELECT id FROM related`
+	default:
+		return nil, ErrInvalid
+	}
+	rows, err := tx.QueryContext(ctx, query, entityID)
+	if err != nil {
+		return nil, err
+	}
+	members := map[string]bool{}
+	for rows.Next() {
+		var id string
+		if err = rows.Scan(&id); err != nil {
+			rows.Close()
+			return nil, err
+		}
+		if id != entityID {
+			members[id] = true
+		}
+	}
+	if err = rows.Err(); err != nil {
+		rows.Close()
+		return nil, err
+	}
+	if err = rows.Close(); err != nil {
+		return nil, err
+	}
+	cache[cacheKey] = members
+	return members, nil
 }
 
 func globMatch(pattern, value string) (bool, error) {

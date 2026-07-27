@@ -24,6 +24,8 @@ Additional coverage includes hostile path sanitization, regular-file and
 source-tree imports, inert symlink handling, package payloads, bounded
 cross-chunk byte search, traceable saved searches, typed locator round trips,
 temporal overlap queries, bounded metadata search, FTS5 startup,
+composable provenance ancestor/descendant filtering with frozen-selection
+stability as cases grow,
 multi-agent activity attribution, custody history, revision-stable idempotent
 replays, isolated concurrent parser orchestration, durable partial parse
 results, explicit recovery inspection and completion, auditable deliverable
